@@ -1,0 +1,5 @@
+^\.git$
+^\.Rhistory$
+^\.codex$
+^\.agents$
+^tests$

@@ -1,0 +1,25 @@
+Package: TFRegAct
+Type: Package
+Title: Bayesian Transcription Factor Regulation and Activity Inference
+Version: 0.0.0.9000
+Authors@R: 
+    person(given = "TBD", family = "TBD", role = c("aut", "cre"),
+           email = "tbd@example.org")
+Description: Tools for constructing transcription-factor regulatory networks,
+    estimating TF-to-gene regulatory direction, and inferring cell-level TF
+    activity from single-cell expression data.
+License: GPL-3
+Encoding: UTF-8
+LazyData: false
+Roxygen: list(markdown = TRUE)
+Imports:
+    cmdstanr,
+    dagitty,
+    data.table,
+    igraph,
+    methods,
+    posterior,
+    Seurat,
+    stats,
+    tools,
+    utils
