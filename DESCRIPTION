@@ -14,12 +14,14 @@ LazyData: false
 Roxygen: list(markdown = TRUE)
 Imports:
     cmdstanr,
-    dagitty,
     data.table,
     igraph,
     methods,
     posterior,
+    Rcpp,
     Seurat,
     stats,
     tools,
     utils
+LinkingTo:
+    Rcpp

@@ -59,6 +59,9 @@ edge_fit$direction_summary
 For activity inference, omit `target_gene`. The function identifies direct
 targets, finds target-specific adjustment sets, performs screening and MCMC
 refinement, then returns a Seurat object containing `<TF>_activity_A`.
+By default, direct target edges and prior-network edges must have confidence
+at least 4. Adjustment sets are selected from eight randomized starts, using
+the smallest valid set first and path-edge confidence to break size ties.
 
 ```r
 activity_input <- create_TF_computation_input(

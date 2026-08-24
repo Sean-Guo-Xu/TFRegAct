@@ -106,9 +106,10 @@ tf_stage1_screening_validate_input <- function(screening_input) {
   if (!is.list(screening_input) || !length(screening_input)) {
     tf_stage1_screening_stop("`screening_input` must be a non-empty nested list.")
   }
-  if (!isTRUE(attr(screening_input, "direct_confounders_only"))) {
+  if (!isTRUE(attr(screening_input, "recursive_adjustment_search")) &&
+      !isTRUE(attr(screening_input, "direct_confounders_only"))) {
     tf_stage1_screening_stop(
-      "`screening_input` must be the direct-confounder Stage 1 object."
+      "`screening_input` must contain a validated causal adjustment search."
     )
   }
   if (!identical(

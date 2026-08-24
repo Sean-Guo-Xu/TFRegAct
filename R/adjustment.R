@@ -154,6 +154,38 @@ find_adjustment_dagitty_read_edges <- function(path) {
   unique(df)
 }
 
+find_adjustment_dagitty_filter_prior_edges <- function(
+  edges,
+  confidence_threshold,
+  exposure = NULL,
+  outcome = NULL
+) {
+  confidence_threshold <- suppressWarnings(as.numeric(confidence_threshold[[1L]]))
+  if (!is.finite(confidence_threshold) || confidence_threshold < 0) {
+    stop("`confidence_threshold` must be finite and non-negative.", call. = FALSE)
+  }
+  confidence <- suppressWarnings(as.numeric(edges$confidence_score))
+  keep <- is.finite(confidence) & confidence >= confidence_threshold
+
+  # The queried exposure -> outcome edge defines the estimand and may have been
+  # manually accepted upstream. Keep it even when its database score is below
+  # the confounder-network threshold; it is removed from the back-door graph
+  # during validation and therefore cannot create a spurious back-door path.
+  if (!is.null(exposure) && !is.null(outcome)) {
+    keep_query <- toupper(trimws(as.character(edges$tf))) ==
+      toupper(trimws(as.character(exposure[[1L]]))) &
+      toupper(trimws(as.character(edges$target))) ==
+      toupper(trimws(as.character(outcome[[1L]])))
+    keep_query[is.na(keep_query)] <- FALSE
+    keep <- keep | keep_query
+  }
+  filtered <- edges[keep, , drop = FALSE]
+  attr(filtered, "confidence_threshold") <- confidence_threshold
+  attr(filtered, "edges_before_threshold") <- nrow(edges)
+  attr(filtered, "edges_after_threshold") <- nrow(filtered)
+  filtered
+}
+
 find_adjustment_dagitty_sanitize_node <- function(x) {
   y <- gsub("[^A-Za-z0-9_]", "_", x)
   y <- gsub("_+", "_", y)
@@ -546,21 +578,38 @@ find_adjustment_dagitty_build_recommended_metrics <- function(
   tf_tree <- find_adjustment_dagitty_prepare_target_tree(graph, tf_query)
 
   vars <- unique(c(recommended_variables, tf_query, gene_query))
-  direct_metrics <- find_adjustment_dagitty_direct_edge_metrics(
-    edges = direct_edges,
-    gene_query = gene_query,
-    regulators = vars
-  )
+  backdoor_vars <- setdiff(vars, tf_query)
+  backdoor_paths <- tf_recursive_adjustment_score_paths(
+    dag_edges = edges,
+    adjustment_set = backdoor_vars,
+    outcome = gene_query,
+    exposure = tf_query
+  )$details
+  target_path <- tf_recursive_adjustment_score_paths(
+    dag_edges = edges,
+    adjustment_set = tf_query,
+    outcome = gene_query
+  )$details
+  directed_paths <- rbind(backdoor_paths, target_path)
+  directed_paths <- directed_paths[
+    match(vars, directed_paths$variable), , drop = FALSE
+  ]
   out <- lapply(vars, function(v) {
-    direct_index <- match(v, direct_metrics$tf)
-    direct_distance <- direct_metrics$distance_to_gene_A[[direct_index]]
-    direct_confidence <- direct_metrics$avg_confidence_to_gene_A[[direct_index]]
+    path_index <- match(v, directed_paths$variable)
+    path_distance <- directed_paths$path_length[[path_index]]
+    path_confidence <- directed_paths$path_mean_confidence[[path_index]]
+    path_direction <- directed_paths$path_direction[[path_index]]
+    path_effect <- directed_paths$path_effect[[path_index]]
     to_tf <- find_adjustment_dagitty_best_path_metric(tf_tree, v)
-    avg_to_gene <- if (is.finite(direct_distance)) direct_confidence else 0
+    avg_to_gene <- if (is.finite(path_distance) && path_distance > 0) {
+      path_confidence
+    } else {
+      0
+    }
     avg_to_tf <- if (is.finite(to_tf$distance)) to_tf$avg_confidence else 0
-    overall_avg <- if (is.finite(direct_distance) && is.finite(to_tf$distance)) {
+    overall_avg <- if (is.finite(path_distance) && path_distance > 0 && is.finite(to_tf$distance)) {
       (beta * avg_to_gene + avg_to_tf) / (1 + beta)
-    } else if (is.finite(direct_distance)) {
+    } else if (is.finite(path_distance) && path_distance > 0) {
       avg_to_gene
     } else if (is.finite(to_tf$distance)) {
       avg_to_tf
@@ -569,10 +618,11 @@ find_adjustment_dagitty_build_recommended_metrics <- function(
     }
     data.frame(
       tf = v,
-      distance_to_gene_A = direct_distance,
-      effect_on_gene_A = direct_metrics$effect_on_gene_A[[direct_index]],
-      direction_to_gene_A = direct_metrics$direction_to_gene_A[[direct_index]],
+      distance_to_gene_A = path_distance,
+      effect_on_gene_A = path_effect,
+      direction_to_gene_A = path_direction,
       avg_confidence_to_gene_A = avg_to_gene,
+      selected_path_to_gene_A = directed_paths$selected_path[[path_index]],
       distance_to_tf_B = if (is.finite(to_tf$distance)) to_tf$distance else Inf,
       avg_confidence_to_tf_B = avg_to_tf,
       overall_avg_confidence = overall_avg,
@@ -595,7 +645,10 @@ find_adjustment_dagitty_recommended_metrics <- function(
   beta = 2,
   overall_confidence_threshold = 3,
   build_if_missing = TRUE,
-  max_adjustment_sets = Inf,
+  search_starts = 8L,
+  search_cores = 4L,
+  search_seed = 123L,
+  max_adjustment_sets = NULL,
   write_full_outputs = FALSE,
   write_files = TRUE
 ) {
@@ -623,7 +676,13 @@ find_adjustment_dagitty_recommended_metrics <- function(
   } else {
     find_adjustment_dagitty_extract_edge_file(network = network, edge_file = edge_file)
   }
-  edges <- if (!is.null(bundle)) bundle$edges else find_adjustment_dagitty_read_edges(resolved_edge_file)
+  source_edges <- if (!is.null(bundle)) bundle$edges else find_adjustment_dagitty_read_edges(resolved_edge_file)
+  edges <- find_adjustment_dagitty_filter_prior_edges(
+    edges = source_edges,
+    confidence_threshold = overall_confidence_threshold,
+    exposure = tf_query,
+    outcome = gene_query
+  )
 
   if (is.null(recommended_set_file) || !nzchar(recommended_set_file)) {
     recommended_set_file <- file.path(outdir, sprintf("dagitty_recommended_adjustment_set_%s_%s.csv", tf_query, gene_query))
@@ -641,6 +700,9 @@ find_adjustment_dagitty_recommended_metrics <- function(
       outdir = outdir,
       beta = beta,
       overall_confidence_threshold = overall_confidence_threshold,
+      search_starts = search_starts,
+      search_cores = search_cores,
+      search_seed = search_seed,
       max_adjustment_sets = max_adjustment_sets,
       write_full_outputs = write_full_outputs,
       write_files = write_files
@@ -670,13 +732,21 @@ find_adjustment_dagitty_recommended_metrics <- function(
     gene_query = gene_query,
     recommended_variables = recommended_variables,
     beta = beta,
-    direct_edges = edges
+    direct_edges = source_edges
   )
   keep_forced <- metrics$tf %in% c(tf_query, gene_query)
-  keep_direct <- metrics$distance_to_gene_A == 1
-  keep_conf <- keep_direct &
-    metrics$overall_avg_confidence >= overall_confidence_threshold
-  filtered_metrics <- metrics[keep_forced | keep_conf, , drop = FALSE]
+  keep_adjustment_path <- metrics$tf %in% recommended_variables &
+    is.finite(metrics$distance_to_gene_A) & metrics$distance_to_gene_A > 0
+  filtered_metrics <- metrics[keep_forced | keep_adjustment_path, , drop = FALSE]
+  filtered_metrics$meets_prior_edge_threshold <-
+    keep_forced[keep_forced | keep_adjustment_path] |
+    filtered_metrics$avg_confidence_to_gene_A >= overall_confidence_threshold
+  if (any(!filtered_metrics$meets_prior_edge_threshold)) {
+    stop(
+      "Saved adjustment set is incompatible with the requested prior-edge confidence threshold.",
+      call. = FALSE
+    )
+  }
   rownames(filtered_metrics) <- NULL
 
   outdir <- normalizePath(outdir, winslash = "/", mustWork = FALSE)
@@ -718,25 +788,41 @@ find_adjustment_dagitty_run <- function(
   outdir = "adjustment_output",
   beta = 2,
   overall_confidence_threshold = 3,
-  max_adjustment_sets = Inf,
+  search_starts = 8L,
+  search_cores = 4L,
+  search_seed = 123L,
+  max_iterations = 1000L,
+  max_pair_checks = 200000L,
+  max_ancestor_candidates = 500L,
+  max_pairs_per_ancestor = 20L,
+  max_adjustment_sets = NULL,
   include_candidate_confounders = TRUE,
   write_full_outputs = FALSE,
   write_files = TRUE
 ) {
   find_adjustment_dagitty_install_if_missing("igraph")
-  find_adjustment_dagitty_install_if_missing("dagitty")
   suppressPackageStartupMessages(library(igraph))
-  suppressPackageStartupMessages(library(dagitty))
 
   tf_query <- trimws(as.character(tf))
   gene_query <- trimws(as.character(gene))
   if (!nzchar(tf_query) || !nzchar(gene_query)) {
     stop("`tf` and `gene` must be non-empty strings.")
   }
-  if (length(max_adjustment_sets) == 0 || is.null(max_adjustment_sets) || !is.finite(max_adjustment_sets[[1]])) {
-    max_adjustment_sets <- Inf
-  } else {
-    max_adjustment_sets <- max(1L, as.integer(max_adjustment_sets[[1]]))
+  search_starts <- suppressWarnings(as.integer(search_starts[[1L]]))
+  search_cores <- suppressWarnings(as.integer(search_cores[[1L]]))
+  search_seed <- suppressWarnings(as.integer(search_seed[[1L]]))
+  if (anyNA(c(search_starts, search_cores, search_seed)) ||
+      search_starts < 1L || search_cores < 1L) {
+    stop(
+      "`search_starts` and `search_cores` must be positive integers; `search_seed` must be an integer.",
+      call. = FALSE
+    )
+  }
+  if (!is.null(max_adjustment_sets)) {
+    warning(
+      "`max_adjustment_sets` is retained only for compatibility; use `search_starts`.",
+      call. = FALSE
+    )
   }
 
   bundle <- find_adjustment_dagitty_extract_bundle(network = network, edge_file = edge_file)
@@ -752,8 +838,8 @@ find_adjustment_dagitty_run <- function(
     dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
   }
 
-  edges <- if (!is.null(bundle)) bundle$edges else find_adjustment_dagitty_read_edges(edge_file)
-  all_nodes <- sort(unique(c(edges$tf, edges$target)))
+  source_edges <- if (!is.null(bundle)) bundle$edges else find_adjustment_dagitty_read_edges(edge_file)
+  all_nodes <- sort(unique(c(source_edges$tf, source_edges$target)))
 
   if (!tf_query %in% all_nodes) {
     stop(sprintf("TF '%s' not found in edge file.", tf_query))
@@ -761,13 +847,31 @@ find_adjustment_dagitty_run <- function(
   if (!gene_query %in% all_nodes) {
     stop(sprintf("Gene '%s' not found in edge file.", gene_query))
   }
+  edges <- find_adjustment_dagitty_filter_prior_edges(
+    edges = source_edges,
+    confidence_threshold = overall_confidence_threshold,
+    exposure = tf_query,
+    outcome = gene_query
+  )
+  edges_before_threshold <- attr(edges, "edges_before_threshold")
+  edges_after_threshold <- attr(edges, "edges_after_threshold")
+  trusted_nodes <- unique(c(edges$tf, edges$target))
+  if (!(tf_query %in% trusted_nodes) || !(gene_query %in% trusted_nodes)) {
+    stop(
+      sprintf(
+        "TF `%s` and gene `%s` are not both present after applying confidence threshold %s.",
+        tf_query, gene_query, format(overall_confidence_threshold, trim = TRUE)
+      ),
+      call. = FALSE
+    )
+  }
 
   local_res <- find_adjustment_dagitty_build_local_dag(
     edges,
     tf_query,
     gene_query,
-    graph = if (!is.null(bundle)) bundle$graph else NULL,
-    reverse_graph = if (!is.null(bundle)) bundle$reverse_graph else NULL
+    graph = NULL,
+    reverse_graph = NULL
   )
   dag_edges <- local_res$dag_edges
   node_meta <- local_res$node_meta
@@ -775,7 +879,6 @@ find_adjustment_dagitty_run <- function(
   local_nodes <- sort(unique(c(dag_edges$tf, dag_edges$target, tf_query, gene_query)))
   node_map <- find_adjustment_dagitty_make_node_map(local_nodes)
   id_map <- setNames(node_map$dagitty_id, node_map$node)
-  rev_map <- setNames(node_map$node, node_map$dagitty_id)
 
   dagitty_lines <- c("dag {")
   for (id in node_map$dagitty_id) {
@@ -796,56 +899,67 @@ find_adjustment_dagitty_run <- function(
   }
   dagitty_lines <- c(dagitty_lines, "}")
   dagitty_string <- paste(dagitty_lines, collapse = "\n")
-  g_dag <- dagitty::dagitty(dagitty_string)
-
-  adj_sets_ids <- dagitty::adjustmentSets(
-    g_dag,
-    exposure = id_map[[tf_query]],
-    outcome = id_map[[gene_query]],
-    effect = "total",
-    max.results = max_adjustment_sets
-  )
-  if (length(adj_sets_ids) == 0) {
-    adj_sets_df <- data.frame(set_id = integer(0), variable = character(0), stringsAsFactors = FALSE)
-  } else {
-    adj_sets_df <- do.call(
-      rbind,
-      lapply(seq_along(adj_sets_ids), function(i) {
-        vals <- as.character(adj_sets_ids[[i]])
-        data.frame(
-          set_id = rep(i, length(vals)),
-          variable = unname(rev_map[vals]),
-          stringsAsFactors = FALSE
-        )
-      })
-    )
-  }
-
-  candidate_df <- if (isTRUE(include_candidate_confounders)) {
-    candidate_confounders_ids <- dagitty::adjustmentSets(
-      g_dag,
-      exposure = id_map[[tf_query]],
-      outcome = id_map[[gene_query]],
-      type = "canonical"
-    )
-    if (length(candidate_confounders_ids) == 0) {
-      data.frame(variable = character(0), stringsAsFactors = FALSE)
-    } else {
-      data.frame(
-        variable = unname(rev_map[as.character(candidate_confounders_ids[[1]])]),
-        stringsAsFactors = FALSE
-      )
-    }
-  } else {
-    data.frame(variable = character(0), stringsAsFactors = FALSE)
-  }
 
   dag_edges_out <- dag_edges[, c("tf", "target", "effect", "confidence_score", "supporting_databases"), drop = FALSE]
   dag_edges_out$direction <- find_adjustment_dagitty_effect_to_direction(
     dag_edges_out$effect
   )
+  recursive_search <- tf_recursive_adjustment_search(
+    dag_edges = dag_edges_out,
+    exposure = tf_query,
+    outcome = gene_query,
+    n_starts = search_starts,
+    cores = search_cores,
+    seed = search_seed,
+    max_iterations = max_iterations,
+    max_pair_checks = max_pair_checks,
+    max_ancestor_candidates = max_ancestor_candidates,
+    max_pairs_per_ancestor = max_pairs_per_ancestor
+  )
+  adj_sets_df <- do.call(rbind, lapply(recursive_search$all_starts, function(item) {
+    data.frame(
+      set_id = rep(item$start_id, length(item$final_set)),
+      variable = item$final_set,
+      stringsAsFactors = FALSE
+    )
+  }))
+  candidate_df <- if (isTRUE(include_candidate_confounders)) {
+    data.frame(
+      variable = recursive_search$initial_set,
+      stringsAsFactors = FALSE
+    )
+  } else {
+    data.frame(variable = character(0), stringsAsFactors = FALSE)
+  }
+  winner <- recursive_search$winner
+  winner_paths <- recursive_search$winner_score$details
+  winner_paths <- winner_paths[
+    match(winner$final_set, winner_paths$variable), , drop = FALSE
+  ]
+  recommended_table <- data.frame(
+    set_id = rep(winner$start_id, length(winner$final_set)),
+    variable = winner$final_set,
+    variable_confidence = winner_paths$path_mean_confidence,
+    path_length = winner_paths$path_length,
+    path_confidence_sum = winner_paths$path_confidence_sum,
+    selected_path = winner_paths$selected_path,
+    stringsAsFactors = FALSE
+  )
+  set_scores <- data.frame(
+    set_id = recursive_search$multistart_summary$start_id,
+    set_size = recursive_search$multistart_summary$final_adjustment_size,
+    total_confidence = recursive_search$multistart_summary$total_path_confidence,
+    path_edge_mean_confidence = recursive_search$multistart_summary$path_edge_mean_confidence,
+    final_valid = recursive_search$multistart_summary$final_valid,
+    stringsAsFactors = FALSE
+  )
+  recommended_res <- list(
+    recommended_set_id = winner$start_id,
+    recommended_variables = winner$final_set,
+    recommended_table = recommended_table,
+    set_scores = set_scores
+  )
   node_meta_out <- merge(node_meta, node_map, by = "node", all.x = TRUE, sort = FALSE)
-  recommended_res <- find_adjustment_dagitty_choose_recommended_set(adj_sets_df, dag_edges_out, tf_query, gene_query)
   recommended_metrics <- find_adjustment_dagitty_build_recommended_metrics(
     edges = dag_edges_out,
     tf_query = tf_query,
@@ -855,10 +969,22 @@ find_adjustment_dagitty_run <- function(
     direct_edges = edges
   )
   keep_forced <- recommended_metrics$tf %in% c(tf_query, gene_query)
-  keep_direct <- recommended_metrics$distance_to_gene_A == 1
-  keep_conf <- keep_direct &
-    recommended_metrics$overall_avg_confidence >= overall_confidence_threshold
-  filtered_recommended_metrics <- recommended_metrics[keep_forced | keep_conf, , drop = FALSE]
+  keep_adjustment_path <- recommended_metrics$tf %in% recommended_res$recommended_variables &
+    is.finite(recommended_metrics$distance_to_gene_A) &
+    recommended_metrics$distance_to_gene_A > 0
+  filtered_recommended_metrics <- recommended_metrics[
+    keep_forced | keep_adjustment_path, , drop = FALSE
+  ]
+  filtered_recommended_metrics$meets_prior_edge_threshold <-
+    keep_forced[keep_forced | keep_adjustment_path] |
+    filtered_recommended_metrics$avg_confidence_to_gene_A >=
+      overall_confidence_threshold
+  if (any(!filtered_recommended_metrics$meets_prior_edge_threshold)) {
+    stop(
+      "Internal error: an adjustment path violates the prior-edge confidence threshold.",
+      call. = FALSE
+    )
+  }
   rownames(filtered_recommended_metrics) <- NULL
   node_meta_out$role <- "other"
   node_meta_out$role[node_meta_out$node == tf_query] <- "exposure"
@@ -880,6 +1006,8 @@ find_adjustment_dagitty_run <- function(
       sprintf("dagitty_recommended_adjustment_metrics_filtered_%s_%s.csv", tf_query, gene_query)
     ),
     adjustment_set_scores = file.path(outdir, sprintf("dagitty_adjustment_set_scores_%s_%s.csv", tf_query, gene_query)),
+    randomized_search_summary = file.path(outdir, sprintf("recursive_adjustment_multistart_%s_%s.csv", tf_query, gene_query)),
+    recursive_operations = file.path(outdir, sprintf("recursive_adjustment_operations_%s_%s.csv", tf_query, gene_query)),
     dagitty_graph = file.path(outdir, sprintf("dagitty_graph_%s_%s.txt", tf_query, gene_query)),
     summary = file.path(outdir, sprintf("dagitty_summary_%s_%s.txt", tf_query, gene_query))
   )
@@ -894,6 +1022,8 @@ find_adjustment_dagitty_run <- function(
       utils::write.csv(recommended_res$recommended_table, file = file_map$recommended_adjustment_set, row.names = FALSE)
       utils::write.csv(recommended_metrics, file = file_map$recommended_adjustment_metrics, row.names = FALSE)
       utils::write.csv(recommended_res$set_scores, file = file_map$adjustment_set_scores, row.names = FALSE)
+      utils::write.csv(recursive_search$multistart_summary, file = file_map$randomized_search_summary, row.names = FALSE)
+      utils::write.csv(winner$operations, file = file_map$recursive_operations, row.names = FALSE)
       writeLines(dagitty_string, con = file_map$dagitty_graph)
     }
   }
@@ -902,11 +1032,17 @@ find_adjustment_dagitty_run <- function(
     sprintf("TF: %s", tf_query),
     sprintf("Gene: %s", gene_query),
     sprintf("Edge file: %s", edge_file),
+    sprintf("Prior edges before confidence threshold: %d", edges_before_threshold),
+    sprintf("Prior edges at confidence >= %s: %d", format(overall_confidence_threshold, trim = TRUE), edges_after_threshold),
     sprintf("Local DAG nodes: %d", length(local_nodes)),
     sprintf("Local DAG edges: %d", nrow(dag_edges_out)),
     sprintf("Candidate confounders: %d", nrow(candidate_df)),
-    sprintf("Minimal adjustment sets: %d", if (nrow(adj_sets_df) == 0) 0 else length(unique(adj_sets_df$set_id))),
-    sprintf("Max adjustment sets: %s", if (is.infinite(max_adjustment_sets)) "Inf" else as.character(max_adjustment_sets)),
+    sprintf("Randomized starts: %d", recursive_search$n_starts),
+    sprintf("Search cores: %d", recursive_search$cores),
+    sprintf("Winning start: %d", winner$start_id),
+    sprintf("Winning adjustment size: %d", length(winner$final_set)),
+    sprintf("Winning path-edge mean confidence: %.6f", recursive_search$winner_score$path_edge_mean_confidence),
+    sprintf("Search elapsed seconds: %.3f", recursive_search$search_seconds),
     sprintf("Beta: %s", format(beta, trim = TRUE)),
     sprintf("Overall confidence threshold: %s", format(overall_confidence_threshold, trim = TRUE)),
     sprintf(
@@ -929,6 +1065,11 @@ find_adjustment_dagitty_run <- function(
     gene = gene_query,
     network = network,
     edge_file = edge_file,
+    prior_edge_confidence_threshold = overall_confidence_threshold,
+    prior_edge_counts = c(
+      before = edges_before_threshold,
+      after = edges_after_threshold
+    ),
     dag_edges = dag_edges_out,
     dag_nodes = node_meta_out,
     candidate_confounders = candidate_df,
@@ -937,6 +1078,7 @@ find_adjustment_dagitty_run <- function(
     recommended_adjustment_metrics = recommended_metrics,
     filtered_recommended_adjustment_metrics = filtered_recommended_metrics,
     adjustment_set_scores = recommended_res$set_scores,
+    randomized_search = recursive_search,
     dagitty_graph = dagitty_string,
     files = file_map,
     summary = summary_lines
@@ -953,7 +1095,10 @@ find_adjustment_dagitty <- function(
   outdir = "adjustment_output",
   beta = 2,
   overall_confidence_threshold = 3,
-  max_adjustment_sets = Inf,
+  search_starts = 8L,
+  search_cores = 4L,
+  search_seed = 123L,
+  max_adjustment_sets = NULL,
   include_candidate_confounders = TRUE,
   write_full_outputs = FALSE,
   write_files = TRUE
@@ -966,6 +1111,9 @@ find_adjustment_dagitty <- function(
     outdir = outdir,
     beta = beta,
     overall_confidence_threshold = overall_confidence_threshold,
+    search_starts = search_starts,
+    search_cores = search_cores,
+    search_seed = search_seed,
     max_adjustment_sets = max_adjustment_sets,
     include_candidate_confounders = include_candidate_confounders,
     write_full_outputs = write_full_outputs,
@@ -993,7 +1141,9 @@ find_adjustment_dagitty_main <- function() {
     outdir = find_adjustment_dagitty_get_arg(args, "--outdir", "adjustment_output"),
     beta = as.numeric(find_adjustment_dagitty_get_arg(args, "--beta", "2")),
     overall_confidence_threshold = as.numeric(find_adjustment_dagitty_get_arg(args, "--overall_confidence_threshold", "3")),
-    max_adjustment_sets = suppressWarnings(as.numeric(find_adjustment_dagitty_get_arg(args, "--max_adjustment_sets", "Inf"))),
+    search_starts = as.integer(find_adjustment_dagitty_get_arg(args, "--search_starts", "8")),
+    search_cores = as.integer(find_adjustment_dagitty_get_arg(args, "--search_cores", "4")),
+    search_seed = as.integer(find_adjustment_dagitty_get_arg(args, "--search_seed", "123")),
     write_full_outputs = tolower(find_adjustment_dagitty_get_arg(args, "--write_full_outputs", "false")) == "true",
     write_files = TRUE
   )

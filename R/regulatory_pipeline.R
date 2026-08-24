@@ -66,7 +66,9 @@ TF_regulatory_direction_computation <- function(
   libsize = NULL,
   network_edge_file = .tfregact_default_network_file(),
   confounder_confidence_threshold = 3,
-  max_adjustment_sets = 100L,
+  adjustment_search_starts = 8L,
+  adjustment_search_cores = 4L,
+  max_adjustment_sets = NULL,
   dagitty_beta = 2,
   gamma = 1,
   eta = 0.5,
@@ -97,6 +99,12 @@ TF_regulatory_direction_computation <- function(
   force_recompile = FALSE
 ) {
   stage2_model <- match.arg(stage2_model)
+  if (!is.null(max_adjustment_sets)) {
+    warning(
+      "`max_adjustment_sets` is obsolete and ignored; use `adjustment_search_starts`.",
+      call. = FALSE
+    )
+  }
   .tf_regulatory_direction_load_dependencies()
   if (!is.null(input)) {
     if (!is.null(seurat_obj) || !is.null(data_file)) .tf_regulatory_direction_stop("When `input` is supplied, do not also supply `seurat_obj` or `data_file`.")
@@ -135,7 +143,10 @@ TF_regulatory_direction_computation <- function(
   adjustment <- find_adjustment_dagitty(
     tf = target_tf, gene = target_gene, edge_file = network_edge_file, outdir = work_dir,
     beta = dagitty_beta, overall_confidence_threshold = confounder_confidence_threshold,
-    max_adjustment_sets = max_adjustment_sets, write_full_outputs = persist_output,
+    search_starts = adjustment_search_starts,
+    search_cores = adjustment_search_cores,
+    search_seed = seed,
+    write_full_outputs = persist_output,
     write_files = persist_output
   )
   adjustment_elapsed <- as.numeric(difftime(Sys.time(), adjustment_started, units = "secs"))

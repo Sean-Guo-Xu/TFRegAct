@@ -377,7 +377,7 @@ query_TF_direct_target_override_map <- function(x, target_genes) {
 #' @param target_tf One TF symbol.
 #' @param network Optional edge data.frame, network bundle/build result, or file path.
 #' @param edge_file Default network bundle used when `network` is NULL.
-#' @param confidence_threshold Minimum final confidence; defaults to 7.
+#' @param confidence_threshold Minimum final confidence; defaults to 4.
 #' @param target_confidence_override Optional named numeric vector or data.frame.
 #'   A supplied value replaces both the finite query value and the automatic
 #'   no-path default for that gene.
@@ -391,7 +391,7 @@ query_TF_direct_target_genes <- function(
   target_tf,
   network = NULL,
   edge_file = .tfregact_default_network_file(),
-  confidence_threshold = 7,
+  confidence_threshold = 4,
   target_confidence_override = NULL,
   edit_target_confidence = FALSE,
   return_all = FALSE,

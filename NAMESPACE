@@ -1,5 +1,7 @@
 import(methods)
 import(data.table)
+importFrom(Rcpp,evalCpp)
+useDynLib(TFRegAct, .registration = TRUE)
 
 export(create_TF_computation_input)
 export(build_tf_network)

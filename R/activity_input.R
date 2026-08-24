@@ -143,7 +143,9 @@ tf_stage1_input_query_one_adjustment <- function(target_gene, target_tf, config)
       outdir = config$outdir,
       beta = config$beta,
       overall_confidence_threshold = config$confounder_confidence_threshold,
-      max_adjustment_sets = config$max_adjustment_sets,
+      search_starts = config$search_starts,
+      search_cores = 1L,
+      search_seed = config$search_seed,
       include_candidate_confounders = FALSE,
       write_full_outputs = FALSE,
       write_files = FALSE
@@ -170,7 +172,7 @@ tf_stage1_input_query_one_adjustment <- function(target_gene, target_tf, config)
   })
 }
 
-#' Find the best direct-confounder adjustment set for each direct target gene.
+#' Find a validated recursive adjustment set for each direct target gene.
 query_TF_target_adjustment_sets <- function(
   target_tf,
   target_genes,
@@ -178,7 +180,8 @@ query_TF_target_adjustment_sets <- function(
   outdir = "adjustment_output",
   beta = 2,
   confounder_confidence_threshold = 4,
-  max_adjustment_sets = 100L,
+  search_starts = 8L,
+  search_seed = 123L,
   cores = 4L,
   checkpoint_count = 2L,
   output_file = NULL,
@@ -190,30 +193,48 @@ query_TF_target_adjustment_sets <- function(
     tf_stage1_input_stop("`target_genes` must contain at least one gene.")
   }
   cores <- as.integer(cores[[1]])
-  max_adjustment_sets <- as.integer(max_adjustment_sets[[1]])
+  search_starts <- as.integer(search_starts[[1]])
+  search_seed <- as.integer(search_seed[[1]])
   checkpoint_count <- as.integer(checkpoint_count[[1]])
-  if (is.na(cores) || cores < 1L || is.na(max_adjustment_sets) || max_adjustment_sets < 1L ||
+  if (is.na(cores) || cores < 1L || is.na(search_starts) || search_starts < 1L ||
       is.na(checkpoint_count) || checkpoint_count < 0L) {
-    tf_stage1_input_stop("`cores` and `max_adjustment_sets` must be positive; `checkpoint_count` must be nonnegative.")
+    tf_stage1_input_stop("`cores` and `search_starts` must be positive; `checkpoint_count` must be nonnegative.")
   }
   config <- list(
     edge_file = edge_file,
     outdir = outdir,
     beta = as.numeric(beta),
     confounder_confidence_threshold = as.numeric(confounder_confidence_threshold),
-    max_adjustment_sets = max_adjustment_sets
+    search_starts = search_starts,
+    search_seed = search_seed
   )
   results <- stats::setNames(vector("list", length(target_genes)), target_genes)
+  attr(results, "target_tf") <- target_tf
+  attr(results, "confounder_confidence_threshold") <- config$confounder_confidence_threshold
+  attr(results, "search_starts") <- config$search_starts
+  attr(results, "search_seed") <- config$search_seed
+  attr(results, "max_adjustment_sets") <- config$search_starts
+  attr(results, "direct_confounders_only") <- FALSE
+  attr(results, "recursive_adjustment_search") <- TRUE
   if (!is.null(output_file)) {
     output_file <- normalizePath(output_file, winslash = "/", mustWork = FALSE)
     dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
     if (isTRUE(resume) && file.exists(output_file)) {
       cached <- readRDS(output_file)
-      cached_names <- intersect(names(cached), target_genes)
-      cached_names <- cached_names[vapply(cached[cached_names], function(x) {
-        is.list(x) && identical(x$status, "ok")
-      }, logical(1))]
-      results[cached_names] <- cached[cached_names]
+      cache_compatible <- identical(attr(cached, "recursive_adjustment_search"), TRUE) &&
+        identical(as.integer(attr(cached, "search_starts")), config$search_starts) &&
+        identical(as.integer(attr(cached, "search_seed")), config$search_seed) &&
+        isTRUE(all.equal(
+          as.numeric(attr(cached, "confounder_confidence_threshold")),
+          config$confounder_confidence_threshold
+        ))
+      if (isTRUE(cache_compatible)) {
+        cached_names <- intersect(names(cached), target_genes)
+        cached_names <- cached_names[vapply(cached[cached_names], function(x) {
+          is.list(x) && identical(x$status, "ok")
+        }, logical(1))]
+        results[cached_names] <- cached[cached_names]
+      }
     }
   }
   pending <- names(results)[vapply(results, is.null, logical(1))]
@@ -283,8 +304,11 @@ query_TF_target_adjustment_sets <- function(
   }
   attr(results, "target_tf") <- target_tf
   attr(results, "confounder_confidence_threshold") <- config$confounder_confidence_threshold
-  attr(results, "max_adjustment_sets") <- config$max_adjustment_sets
-  attr(results, "direct_confounders_only") <- TRUE
+  attr(results, "search_starts") <- config$search_starts
+  attr(results, "search_seed") <- config$search_seed
+  attr(results, "max_adjustment_sets") <- config$search_starts
+  attr(results, "direct_confounders_only") <- FALSE
+  attr(results, "recursive_adjustment_search") <- TRUE
   if (!is.null(output_file)) saveRDS(results, output_file)
   results
 }
@@ -408,7 +432,8 @@ build_TF_stage1_screening_input <- function(
   attr(result, "stage2_interface_ready") <- TRUE
   attr(result, "directional_prior") <- TRUE
   attr(result, "edge_direction_included") <- TRUE
-  attr(result, "direct_confounders_only") <- TRUE
+  attr(result, "direct_confounders_only") <- FALSE
+  attr(result, "recursive_adjustment_search") <- TRUE
   attr(result, "cell_count") <- ncol(seurat_obj)
   attr(result, "batch_column") <- batch_column
   attr(result, "use_batch") <- !is.null(batch_column)
@@ -416,6 +441,8 @@ build_TF_stage1_screening_input <- function(
   attr(result, "confidence_threshold") <- attr(direct_target_edges, "query_summary")$confidence_threshold
   attr(result, "confounder_confidence_threshold") <- attr(adjustment_results, "confounder_confidence_threshold")
   attr(result, "max_adjustment_sets") <- attr(adjustment_results, "max_adjustment_sets")
+  attr(result, "search_starts") <- attr(adjustment_results, "search_starts")
+  attr(result, "search_seed") <- attr(adjustment_results, "search_seed")
   attr(result, "r_dir") <- as.numeric(r_dir)
   attr(result, "target_interaction_sd") <- as.numeric(target_interaction_sd)
   attr(result, "stan_file") <- if (is.null(batch_column)) {

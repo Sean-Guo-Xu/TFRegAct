@@ -61,10 +61,11 @@ TF_activity_computation <- function(
   cores = 4L,
   seed = 123L,
   network_edge_file = .tfregact_default_network_file(),
-  target_confidence_threshold = 7,
+  target_confidence_threshold = 4,
   target_confidence_override = NULL,
   confounder_confidence_threshold = 4,
-  max_adjustment_sets = 100L,
+  adjustment_search_starts = 8L,
+  max_adjustment_sets = NULL,
   dagitty_beta = 2,
   beta_prior_scale = 1,
   eta = 0.5,
@@ -92,6 +93,12 @@ TF_activity_computation <- function(
   force_recompile = FALSE
 ) {
   .tf_activity_computation_load_dependencies()
+  if (!is.null(max_adjustment_sets)) {
+    warning(
+      "`max_adjustment_sets` is obsolete and ignored; use `adjustment_search_starts`.",
+      call. = FALSE
+    )
+  }
   if (!is.null(input)) {
     if (!is.null(seurat_obj) || !is.null(data_file)) .tf_activity_computation_stop("When `input` is supplied, do not also supply `seurat_obj` or `data_file`.")
     input_values <- tf_computation_input_values(input)
@@ -129,7 +136,7 @@ TF_activity_computation <- function(
   graph_search_started <- Sys.time()
   direct_target_edges <- query_TF_direct_target_genes(target_tf = target_tf, edge_file = network_edge_file, confidence_threshold = target_confidence_threshold, target_confidence_override = target_confidence_override, return_all = FALSE)
   if (!nrow(direct_target_edges)) .tf_activity_computation_stop("No direct target genes passed target confidence threshold %s.", target_confidence_threshold)
-  adjustment_results <- query_TF_target_adjustment_sets(target_tf = target_tf, target_genes = direct_target_edges$target_gene, edge_file = network_edge_file, outdir = work_dir, beta = dagitty_beta, confounder_confidence_threshold = confounder_confidence_threshold, max_adjustment_sets = max_adjustment_sets, cores = cores, checkpoint_count = 2L, output_file = if (persist_output) file.path(work_dir, paste0(target_tf, "_adjustment_sets.rds")) else NULL, resume = resume)
+  adjustment_results <- query_TF_target_adjustment_sets(target_tf = target_tf, target_genes = direct_target_edges$target_gene, edge_file = network_edge_file, outdir = work_dir, beta = dagitty_beta, confounder_confidence_threshold = confounder_confidence_threshold, search_starts = adjustment_search_starts, search_seed = seed, cores = cores, checkpoint_count = 2L, output_file = if (persist_output) file.path(work_dir, paste0(target_tf, "_adjustment_sets.rds")) else NULL, resume = resume)
   graph_search_elapsed_seconds <- as.numeric(difftime(Sys.time(), graph_search_started, units = "secs"))
 
   input_build_started <- Sys.time()
