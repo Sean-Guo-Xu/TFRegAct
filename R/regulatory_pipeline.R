@@ -40,8 +40,11 @@
 #'
 #' Supply exactly one input dataset: `seurat_obj` (an in-memory Seurat object)
 #' or `data_file` (an .RData file containing an object named `pbmc`). The Seurat
-#' object must contain the requested assay/layer and metadata columns for
-#' `cell_column`, `condition_column`, and, when used, `batch_column`.
+#' object must contain the requested assay/layer and any metadata columns named
+#' by `cell_column`, `condition_column`, or `batch_column`. Condition and batch
+#' are optional; set the corresponding argument to `NULL` to omit it. When
+#' present, both are encoded in one nuisance design matrix shared by Stage 1
+#' and Stage 2.
 #' The workflow searches a target-specific adjustment set, fits a sparse Stage 1
 #' model, removes unsupported non-target TFs, then fits Stage 2 MCMC. `output`
 #' follows TF_activity_computation(): FALSE returns results only in memory, TRUE
@@ -73,6 +76,7 @@ TF_regulatory_direction_computation <- function(
   gamma = 1,
   eta = 0.5,
   r_dir = 3,
+  nuisance_prior_scale = 1,
   confidence_min = 1,
   confidence_max = 10,
   stage1_chains = 3L,
@@ -165,6 +169,8 @@ TF_regulatory_direction_computation <- function(
     chains = stage1_chains, parallel_chains = stage1_chains,
     iter_warmup = stage1_iter_warmup, iter_sampling = stage1_iter_sampling,
     seed = seed, refresh = refresh, force_recompile = force_recompile,
+    control_level = control_level, disease_level = disease_level,
+    nuisance_prior_scale = nuisance_prior_scale,
     adapt_delta = stage1_adapt_delta, max_treedepth = stage1_max_treedepth
   )
   stage1_elapsed <- as.numeric(difftime(Sys.time(), stage1_started, units = "secs"))
@@ -187,6 +193,7 @@ TF_regulatory_direction_computation <- function(
       parallel_chains = stage2_chains, iter_warmup = stage2_iter_warmup,
       iter_sampling = stage2_iter_sampling, seed = seed + 1L, refresh = refresh,
       compute_loo = compute_loo, force_recompile = force_recompile,
+      nuisance_prior_scale = nuisance_prior_scale,
       adapt_delta = stage2_adapt_delta, max_treedepth = stage2_max_treedepth
     )
   } else {
@@ -200,6 +207,7 @@ TF_regulatory_direction_computation <- function(
       iter_warmup = stage2_iter_warmup, iter_sampling = stage2_iter_sampling,
       seed = seed + 1L, refresh = refresh, compute_loo = compute_loo,
       force_recompile = force_recompile, adapt_delta = stage2_adapt_delta,
+      nuisance_prior_scale = nuisance_prior_scale,
       max_treedepth = stage2_max_treedepth
     )
   }

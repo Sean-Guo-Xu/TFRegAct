@@ -1,7 +1,8 @@
 #!/usr/bin/env Rscript
 
-# Stage 2: keep a target-gene model when the target-TF posterior interval
-# excludes zero in control, disease, or both. Confounders entering this MCMC
+# Stage 2: with condition enabled, keep a target-gene model when the target-TF
+# posterior interval excludes zero in control, disease, or both. Without
+# condition, use the overall target-TF interval. Confounders entering this MCMC
 # stage are never filtered again and propagate unchanged to EM.
 filter_TF_mcmc_gene_results <- function(
   screening_results,
@@ -59,6 +60,9 @@ filter_TF_mcmc_gene_results <- function(
           "Missing or invalid MCMC result."
         },
         target_interval = target_interval,
+        has_condition = NA,
+        target_overall_interval_lower = NA_real_,
+        target_overall_interval_upper = NA_real_,
         target_control_interval_lower = NA_real_,
         target_control_interval_upper = NA_real_,
         target_disease_interval_lower = NA_real_,
@@ -120,14 +124,26 @@ filter_TF_mcmc_gene_results <- function(
       }
     }
 
-    target_keep_control <- isTRUE(
+    has_condition <- isTRUE(model$condition_model)
+    target_keep_overall <- isTRUE(
+      model$target_tf$screening_interval_excludes_zero[[1]]
+    )
+    target_keep_control <- has_condition && isTRUE(
       model$target_tf$control_interval_excludes_zero[[1]]
     )
-    target_keep_disease <- isTRUE(
+    target_keep_disease <- has_condition && isTRUE(
       model$target_tf$disease_interval_excludes_zero[[1]]
     )
-    target_keep <- target_keep_control || target_keep_disease
-    target_support <- if (target_keep_control && target_keep_disease) {
+    target_keep <- if (has_condition) {
+      target_keep_control || target_keep_disease
+    } else {
+      target_keep_overall
+    }
+    target_support <- if (!has_condition && target_keep_overall) {
+      "overall"
+    } else if (!has_condition) {
+      "neither"
+    } else if (target_keep_control && target_keep_disease) {
       "both"
     } else if (target_keep_control) {
       "control_only"
@@ -149,7 +165,8 @@ filter_TF_mcmc_gene_results <- function(
         confounders = model$confounders,
         stage2_parameter_draws = model$stage2_parameter_draws,
         control_level = model$control_level,
-        disease_level = model$disease_level
+        disease_level = model$disease_level,
+        condition_model = has_condition
       )
     }
 
@@ -159,14 +176,19 @@ filter_TF_mcmc_gene_results <- function(
       fit_status = "ok",
       fit_error = NA_character_,
       target_interval = target_interval,
+      has_condition = has_condition,
+      target_overall_interval_lower =
+        model$target_tf$screening_interval_lower[[1]],
+      target_overall_interval_upper =
+        model$target_tf$screening_interval_upper[[1]],
       target_control_interval_lower =
-        model$target_tf$beta_control_interval_lower[[1]],
+        if (has_condition) model$target_tf$beta_control_interval_lower[[1]] else NA_real_,
       target_control_interval_upper =
-        model$target_tf$beta_control_interval_upper[[1]],
+        if (has_condition) model$target_tf$beta_control_interval_upper[[1]] else NA_real_,
       target_disease_interval_lower =
-        model$target_tf$beta_disease_interval_lower[[1]],
+        if (has_condition) model$target_tf$beta_disease_interval_lower[[1]] else NA_real_,
       target_disease_interval_upper =
-        model$target_tf$beta_disease_interval_upper[[1]],
+        if (has_condition) model$target_tf$beta_disease_interval_upper[[1]] else NA_real_,
       target_supported_in = target_support,
       target_gene_retained = target_keep,
       confounder_interval = confounder_interval,
@@ -200,6 +222,15 @@ filter_TF_mcmc_gene_results <- function(
   attr(filtered, "target_interval") <- target_interval
   attr(filtered, "confounder_interval") <- confounder_interval
   attr(filtered, "confounders_filtered") <- FALSE
+  condition_flags <- filter_summary$has_condition[
+    filter_summary$fit_status == "ok" & !is.na(filter_summary$has_condition)
+  ]
+  if (length(condition_flags) && length(unique(condition_flags)) != 1L) {
+    stop("Stage 2 results mix condition-enabled and condition-free models.",
+         call. = FALSE)
+  }
+  attr(filtered, "has_condition") <-
+    length(condition_flags) > 0L && isTRUE(condition_flags[[1]])
   attr(filtered, "prescreen_confounders_filtered") <- identical(
     attr(screening_results, "input_pipeline_stage"),
     "mcmc_input"

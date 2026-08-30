@@ -56,11 +56,11 @@ tf_em_validate_input <- function(stage2_input) {
     stage2_input <- readRDS(stage2_input)
   }
   if (!is.list(stage2_input) ||
-      !identical(stage2_input$interface_version, "tf_em_stage2_input_v1")) {
-    tf_em_stop("`stage2_input` must use interface `tf_em_stage2_input_v1`.")
+      !identical(stage2_input$interface_version, "tf_em_stage2_input_v3")) {
+    tf_em_stop("`stage2_input` must use interface `tf_em_stage2_input_v3`.")
   }
   required <- c(
-    "N", "G", "S", "Y", "eta0_draws", "phi_draws", "condition",
+    "N", "G", "S", "Y", "eta0_draws", "phi_draws", "has_condition", "condition",
     "target_tf_expression", "target_tf_center", "target_tf_scale",
     "beta_target_mean_init", "beta_target_delta_init", "beta_prior_mean",
     "beta_prior_sd", "target_interaction_sd", "cell_names", "target_genes"
@@ -85,6 +85,13 @@ tf_em_validate_input <- function(stage2_input) {
       !is.finite(stage2_input$target_tf_scale) ||
       stage2_input$target_tf_scale <= 0) {
     tf_em_stop("Invalid condition or target-TF activity-anchor metadata.")
+  }
+  has_condition <- isTRUE(stage2_input$has_condition)
+  if (has_condition && !identical(sort(unique(stage2_input$condition)), 0:1)) {
+    tf_em_stop("Condition-enabled EM requires both control and disease cells.")
+  }
+  if (!has_condition && any(stage2_input$condition != 0L)) {
+    tf_em_stop("Condition-free EM must use an all-zero condition vector.")
   }
   if (any(stage2_input$Y < 0) || any(!is.finite(stage2_input$eta0_draws)) ||
       any(!is.finite(stage2_input$phi_draws)) || any(stage2_input$phi_draws <= 0)) {
@@ -349,14 +356,8 @@ tf_em_estep <- function(common, eta0, phi, beta_mean, beta_delta, settings) {
       given_active_mean <- log_normalizer <- numeric(N)
   upper_expansions <- integer(N)
   tail_drop <- numeric(N)
-  beta_control <- beta_mean - 0.5 * beta_delta
-  beta_disease <- beta_mean + 0.5 * beta_delta
   for (i in seq_len(N)) {
-    beta_condition <- if (common$condition[[i]] == 0L) {
-      beta_control
-    } else {
-      beta_disease
-    }
+    beta_condition <- beta_mean + common$condition_shift[[i]] * beta_delta
     posterior <- tf_em_cell_posterior(
       y = common$Y[i, ],
       eta0 = eta0[i, ],
@@ -412,7 +413,7 @@ tf_em_gene_expected_log_posterior <- function(
   return_information = FALSE
 ) {
   beta_by_cell <- parameters[[1]] +
-    (common$condition - 0.5) * parameters[[2]]
+    common$condition_shift * parameters[[2]]
   activity_std <- (estep$nodes - common$target_center) / common$target_scale
   eta <- sweep(activity_std, 1L, beta_by_cell, FUN = "*")
   eta <- sweep(eta, 1L, eta0_gene, FUN = "+")
@@ -437,7 +438,7 @@ tf_em_gene_expected_log_posterior <- function(
   )
   score_eta <- sweep(-score_eta, 1L, y_gene, FUN = "+")
   common_gradient <- estep$weights * score_eta * activity_std
-  condition_shift <- common$condition - 0.5
+  condition_shift <- common$condition_shift
   gradient <- c(
     sum(common_gradient) -
       (parameters[[1]] - common$beta_prior_mean[[gene_index]]) /
@@ -472,46 +473,76 @@ tf_em_mstep <- function(common, eta0, phi, estep, beta_mean, beta_delta, setting
   convergence <- integer(G)
   objective <- numeric(G)
   for (g in seq_len(G)) {
-    objective_function <- function(parameters) {
-      -tf_em_gene_expected_log_posterior(
-        parameters, g, common, eta0[, g], phi[[g]], estep
-      )$value
-    }
-    gradient_function <- function(parameters) {
-      -tf_em_gene_expected_log_posterior(
-        parameters, g, common, eta0[, g], phi[[g]], estep
-      )$gradient
-    }
-    fit <- stats::optim(
-      par = c(beta_mean[[g]], beta_delta[[g]]),
-      fn = objective_function,
-      gr = gradient_function,
-      method = "BFGS",
-      control = list(
-        maxit = settings$mstep_maxit,
-        reltol = settings$mstep_reltol
+    if (common$has_condition) {
+      objective_function <- function(parameters) {
+        -tf_em_gene_expected_log_posterior(
+          parameters, g, common, eta0[, g], phi[[g]], estep
+        )$value
+      }
+      gradient_function <- function(parameters) {
+        -tf_em_gene_expected_log_posterior(
+          parameters, g, common, eta0[, g], phi[[g]], estep
+        )$gradient
+      }
+      fit <- stats::optim(
+        par = c(beta_mean[[g]], beta_delta[[g]]),
+        fn = objective_function,
+        gr = gradient_function,
+        method = "BFGS",
+        control = list(
+          maxit = settings$mstep_maxit,
+          reltol = settings$mstep_reltol
+        )
       )
-    )
+      fitted_parameters <- fit$par
+    } else {
+      objective_function <- function(beta) {
+        -tf_em_gene_expected_log_posterior(
+          c(beta[[1]], 0), g, common, eta0[, g], phi[[g]], estep
+        )$value
+      }
+      gradient_function <- function(beta) {
+        -tf_em_gene_expected_log_posterior(
+          c(beta[[1]], 0), g, common, eta0[, g], phi[[g]], estep
+        )$gradient[[1]]
+      }
+      fit <- stats::optim(
+        par = beta_mean[[g]],
+        fn = objective_function,
+        gr = gradient_function,
+        method = "BFGS",
+        control = list(
+          maxit = settings$mstep_maxit,
+          reltol = settings$mstep_reltol
+        )
+      )
+      fitted_parameters <- c(fit$par[[1]], 0)
+    }
     if (any(!is.finite(fit$par)) || !is.finite(fit$value)) {
       tf_em_stop("Non-finite M-step result for gene `%s`.", common$target_genes[[g]])
     }
-    updated_mean[[g]] <- fit$par[[1]]
-    updated_delta[[g]] <- fit$par[[2]]
+    updated_mean[[g]] <- fitted_parameters[[1]]
+    updated_delta[[g]] <- fitted_parameters[[2]]
     convergence[[g]] <- fit$convergence
     objective[[g]] <- -fit$value
     information <- tf_em_gene_expected_log_posterior(
-      fit$par, g, common, eta0[, g], phi[[g]], estep,
+      fitted_parameters, g, common, eta0[, g], phi[[g]], estep,
       return_information = TRUE
     )$information
-    covariance[, , g] <- tryCatch(
-      solve(information),
-      error = function(e) {
-        eigen_result <- eigen(information, symmetric = TRUE)
-        eigen_result$vectors %*%
-          diag(1 / pmax(eigen_result$values, 1e-10), 2L) %*%
-          t(eigen_result$vectors)
-      }
-    )
+    if (common$has_condition) {
+      covariance[, , g] <- tryCatch(
+        solve(information),
+        error = function(e) {
+          eigen_result <- eigen(information, symmetric = TRUE)
+          eigen_result$vectors %*%
+            diag(1 / pmax(eigen_result$values, 1e-10), 2L) %*%
+            t(eigen_result$vectors)
+        }
+      )
+    } else {
+      covariance[, , g] <- matrix(0, 2L, 2L)
+      covariance[1L, 1L, g] <- 1 / pmax(information[1L, 1L], 1e-10)
+    }
   }
   list(
     beta_mean = updated_mean,
@@ -523,9 +554,13 @@ tf_em_mstep <- function(common, eta0, phi, estep, beta_mean, beta_delta, setting
 }
 
 tf_em_beta_log_prior <- function(beta_mean, beta_delta, common) {
-  sum(-0.5 * ((beta_mean - common$beta_prior_mean) /
-                common$beta_prior_sd) ^ 2) +
-    sum(-0.5 * (beta_delta / common$target_interaction_sd) ^ 2)
+  result <- sum(-0.5 * ((beta_mean - common$beta_prior_mean) /
+                         common$beta_prior_sd) ^ 2)
+  if (common$has_condition) {
+    result <- result +
+      sum(-0.5 * (beta_delta / common$target_interaction_sd) ^ 2)
+  }
+  result
 }
 
 tf_em_relative_change <- function(new, old, epsilon = 1e-8) {
@@ -539,10 +574,14 @@ tf_em_scaled_beta_change <- function(
   old_delta,
   common
 ) {
-  max(
-    abs(new_mean - old_mean) / common$beta_prior_sd,
-    abs(new_delta - old_delta) / common$target_interaction_sd
-  )
+  changes <- abs(new_mean - old_mean) / common$beta_prior_sd
+  if (common$has_condition) {
+    changes <- c(
+      changes,
+      abs(new_delta - old_delta) / common$target_interaction_sd
+    )
+  }
+  max(changes)
 }
 
 tf_em_scaled_activity_change <- function(new, old, common) {
@@ -567,7 +606,7 @@ tf_em_fit_one_draw <- function(job, common, settings) {
     eta0 <- job$eta0
     phi <- job$phi
     beta_mean <- common$beta_mean_init
-    beta_delta <- common$beta_delta_init
+    beta_delta <- if (common$has_condition) common$beta_delta_init else rep(0, common$G)
     previous_activity <- common$activity_anchor
     previous_objective <- -Inf
     trace_rows <- vector("list", settings$max_iter)
@@ -641,10 +680,21 @@ tf_em_fit_one_draw <- function(job, common, settings) {
     )
     beta_posterior_sample <- matrix(NA_real_, common$G, 2L)
     for (g in seq_len(common$G)) {
-      beta_posterior_sample[g, ] <- tf_em_sample_bivariate_normal(
-        c(beta_mean[[g]], beta_delta[[g]]),
-        last_mstep$covariance[, , g]
-      )
+      if (common$has_condition) {
+        beta_posterior_sample[g, ] <- tf_em_sample_bivariate_normal(
+          c(beta_mean[[g]], beta_delta[[g]]),
+          last_mstep$covariance[, , g]
+        )
+      } else {
+        beta_posterior_sample[g, ] <- c(
+          stats::rnorm(
+            1L,
+            mean = beta_mean[[g]],
+            sd = sqrt(pmax(last_mstep$covariance[1L, 1L, g], 0))
+          ),
+          0
+        )
+      }
     }
     trace <- do.call(rbind, trace_rows[!vapply(trace_rows, is.null, logical(1))])
     list(
@@ -750,10 +800,14 @@ tf_em_summarize_draw_results <- function(draw_results, common, settings) {
   }
   activity_summary <- data.frame(
     cell = common$cell_names,
-    condition = common$condition,
-    condition_label = ifelse(
-      common$condition == 0L, common$control_level, common$disease_level
-    ),
+    condition = if (common$has_condition) common$condition else NA_integer_,
+    condition_label = if (common$has_condition) {
+      ifelse(
+        common$condition == 0L, common$control_level, common$disease_level
+      )
+    } else {
+      rep("Overall", N)
+    },
     target_tf_expression = common$activity_anchor,
     activity_prior_probability = common$active_prior_probability,
     activity_active_probability = total_active_probability,
@@ -838,34 +892,14 @@ tf_em_summarize_draw_results <- function(draw_results, common, settings) {
     elapsed_seconds = vapply(draw_results, `[[`, numeric(1), "elapsed_seconds"),
     stringsAsFactors = FALSE
   )
-  control_cells <- common$condition == 0L
-  disease_cells <- common$condition == 1L
-  if (!any(control_cells) || !any(disease_cells)) {
-    tf_em_stop("Both control and disease cells are required to summarize activity differences.")
-  }
-  # Each column corresponds to one independently fitted nuisance posterior draw.
-  # The ``sample`` contrast additionally propagates the cell-level activity
-  # posterior by using one discrete posterior draw for every cell.
   activity_condition_difference_by_draw <- data.frame(
-    draw_id = draw_ids,
-    control_activity_conditional_mean = colMeans(
-      activity_mean[control_cells, , drop = FALSE]
-    ),
-    disease_activity_conditional_mean = colMeans(
-      activity_mean[disease_cells, , drop = FALSE]
-    ),
-    disease_minus_control_conditional_mean = colMeans(
-      activity_mean[disease_cells, , drop = FALSE]
-    ) - colMeans(activity_mean[control_cells, , drop = FALSE]),
-    control_activity_posterior_sample = colMeans(
-      activity_sample[control_cells, , drop = FALSE]
-    ),
-    disease_activity_posterior_sample = colMeans(
-      activity_sample[disease_cells, , drop = FALSE]
-    ),
-    disease_minus_control_posterior_sample = colMeans(
-      activity_sample[disease_cells, , drop = FALSE]
-    ) - colMeans(activity_sample[control_cells, , drop = FALSE]),
+    draw_id = integer(0),
+    control_activity_conditional_mean = numeric(0),
+    disease_activity_conditional_mean = numeric(0),
+    disease_minus_control_conditional_mean = numeric(0),
+    control_activity_posterior_sample = numeric(0),
+    disease_activity_posterior_sample = numeric(0),
+    disease_minus_control_posterior_sample = numeric(0),
     stringsAsFactors = FALSE
   )
   summarize_difference <- function(values, contrast_type) {
@@ -885,23 +919,70 @@ tf_em_summarize_draw_results <- function(draw_results, common, settings) {
       stringsAsFactors = FALSE
     )
   }
-  activity_condition_difference_summary <- rbind(
-    summarize_difference(
-      activity_condition_difference_by_draw$disease_minus_control_conditional_mean,
-      "conditional_posterior_mean"
-    ),
-    summarize_difference(
-      activity_condition_difference_by_draw$disease_minus_control_posterior_sample,
-      "one_activity_posterior_sample_per_cell"
-    )
+  activity_condition_difference_summary <- data.frame(
+    contrast = character(0),
+    contrast_type = character(0),
+    nuisance_draws = integer(0),
+    mean = numeric(0),
+    sd = numeric(0),
+    q05 = numeric(0),
+    median = numeric(0),
+    q95 = numeric(0),
+    probability_disease_higher = numeric(0),
+    stringsAsFactors = FALSE
   )
+  if (common$has_condition) {
+    control_cells <- common$condition == 0L
+    disease_cells <- common$condition == 1L
+    # Each column corresponds to one independently fitted nuisance posterior
+    # draw. The sample contrast also propagates cell-level activity uncertainty.
+    activity_condition_difference_by_draw <- data.frame(
+      draw_id = draw_ids,
+      control_activity_conditional_mean = colMeans(
+        activity_mean[control_cells, , drop = FALSE]
+      ),
+      disease_activity_conditional_mean = colMeans(
+        activity_mean[disease_cells, , drop = FALSE]
+      ),
+      disease_minus_control_conditional_mean = colMeans(
+        activity_mean[disease_cells, , drop = FALSE]
+      ) - colMeans(activity_mean[control_cells, , drop = FALSE]),
+      control_activity_posterior_sample = colMeans(
+        activity_sample[control_cells, , drop = FALSE]
+      ),
+      disease_activity_posterior_sample = colMeans(
+        activity_sample[disease_cells, , drop = FALSE]
+      ),
+      disease_minus_control_posterior_sample = colMeans(
+        activity_sample[disease_cells, , drop = FALSE]
+      ) - colMeans(activity_sample[control_cells, , drop = FALSE]),
+      stringsAsFactors = FALSE
+    )
+    activity_condition_difference_summary <- rbind(
+      summarize_difference(
+        activity_condition_difference_by_draw$disease_minus_control_conditional_mean,
+        "conditional_posterior_mean"
+      ),
+      summarize_difference(
+        activity_condition_difference_by_draw$disease_minus_control_posterior_sample,
+        "one_activity_posterior_sample_per_cell"
+      )
+    )
+  }
+  beta_summary <- if (R == 1L) {
+    summarize_single_beta(draw_results[[1]])
+  } else {
+    summarize_beta(beta_mean_sample, beta_delta_sample)
+  }
+  if (!common$has_condition) {
+    condition_specific_columns <- grep(
+      "^beta_(control|disease)_", names(beta_summary), value = TRUE
+    )
+    beta_summary[condition_specific_columns] <- NA_real_
+  }
   list(
     activity_summary = activity_summary,
-    beta_summary = if (R == 1L) {
-      summarize_single_beta(draw_results[[1]])
-    } else {
-      summarize_beta(beta_mean_sample, beta_delta_sample)
-    },
+    beta_summary = beta_summary,
     summary_method = if (R == 1L) {
       "conditional_posterior_and_laplace"
     } else {
@@ -927,11 +1008,10 @@ tf_em_summarize_draw_results <- function(draw_results, common, settings) {
 #' Each cell has an exact inactive state A = 0 and a positive truncated-normal
 #' slab anchored to target-TF normalized expression. The negative-binomial
 #' likelihood of all retained downstream genes updates the posterior active
-#' probability. `active_prior_zero` and `active_prior_positive` are fixed,
-#' tunable gate priors for cells without and with detected TF expression.
-#' By default, a zero target-TF expression is a hard anchor: its activity is
-#' exactly zero. Set `hard_zero_expression = FALSE` to instead use
-#' `active_prior_zero` as a dropout-tolerant soft gate.
+#' probability. `active_prior_zero` is the tunable gate prior for cells without
+#' detected TF expression. Cells with detected TF expression use a fixed prior
+#' active probability of 0.9. The gate is soft in both groups, so zero TF
+#' expression strongly downweights activity without forcing it to exactly zero.
 #'
 #' With `nuisance_draw_count = 0`, eta0 and phi use their Stage 1 posterior
 #' means and one EM fit is run. A positive count selects that many evenly spaced
@@ -945,10 +1025,8 @@ run_TF_EM_latent_activity <- function(
   nuisance_draw_ids = NULL,
   cores = 4L,
   kappa = 1,
-  active_prior_zero = 0.1,
-  active_prior_positive = 0.9,
+  active_prior_zero = 0.2,
   expression_zero_tolerance = 0,
-  hard_zero_expression = TRUE,
   quadrature_nodes = 21L,
   max_iter = 30L,
   min_iter = 2L,
@@ -1025,21 +1103,16 @@ run_TF_EM_latent_activity <- function(
       any(!is.finite(numeric_positive)) || any(numeric_positive <= 0)) {
     tf_em_stop("Invalid EM numerical configuration.")
   }
-  gate_configuration <- c(
-    active_prior_zero,
-    active_prior_positive,
-    expression_zero_tolerance
-  )
+  active_prior_positive <- 0.9
+  gate_configuration <- c(active_prior_zero, expression_zero_tolerance)
   if (any(!is.finite(gate_configuration)) ||
-      active_prior_zero <= 0 || active_prior_zero >= 1 ||
-      active_prior_positive <= 0 || active_prior_positive >= 1 ||
-      active_prior_positive < active_prior_zero ||
+      active_prior_zero <= 0 || active_prior_zero >= active_prior_positive ||
       expression_zero_tolerance < 0) {
     tf_em_stop(
       paste0(
-        "Activity-gate priors must lie strictly between zero and one, ",
-        "the positive-expression prior cannot be smaller than the zero-expression ",
-        "prior, and `expression_zero_tolerance` must be nonnegative."
+        "`active_prior_zero` must lie strictly between 0 and the fixed ",
+        "positive-expression prior (0.9), and `expression_zero_tolerance` ",
+        "must be nonnegative."
       )
     )
   }
@@ -1049,14 +1122,20 @@ run_TF_EM_latent_activity <- function(
     stage2_input$target_tf_expression <= expression_zero_tolerance
   active_prior_probability <- ifelse(
     expression_is_zero,
-    if (isTRUE(hard_zero_expression)) 0 else as.numeric(active_prior_zero),
-    as.numeric(active_prior_positive)
+    as.numeric(active_prior_zero),
+    active_prior_positive
   )
   common <- list(
     N = stage2_input$N,
     G = stage2_input$G,
     Y = stage2_input$Y,
+    has_condition = isTRUE(stage2_input$has_condition),
     condition = as.integer(stage2_input$condition),
+    condition_shift = if (isTRUE(stage2_input$has_condition)) {
+      as.numeric(stage2_input$condition) - 0.5
+    } else {
+      rep(0, stage2_input$N)
+    },
     activity_anchor = as.numeric(stage2_input$target_tf_expression),
     active_prior_probability = active_prior_probability,
     sigma_activity = sigma_activity,
@@ -1090,9 +1169,9 @@ run_TF_EM_latent_activity <- function(
     kappa = as.numeric(kappa),
     sigma_activity = sigma_activity,
     active_prior_zero = as.numeric(active_prior_zero),
-    active_prior_positive = as.numeric(active_prior_positive),
+    active_prior_positive = active_prior_positive,
     expression_zero_tolerance = as.numeric(expression_zero_tolerance),
-    hard_zero_expression = isTRUE(hard_zero_expression),
+    hard_zero_expression = FALSE,
     activity_model = "spike_and_truncated_normal_slab"
   )
   signature <- paste(
@@ -1267,6 +1346,7 @@ run_TF_EM_latent_activity <- function(
   result <- c(list(
     interface_version = "tf_em_latent_activity_fit_v1",
     target_tf = stage2_input$target_tf,
+    has_condition = isTRUE(stage2_input$has_condition),
     nuisance_mode = nuisance_mode,
     nuisance_draw_count = nuisance_draw_count,
     nuisance_draw_ids = nuisance_draw_ids,

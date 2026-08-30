@@ -1,5 +1,7 @@
 import(methods)
 import(data.table)
+importFrom(stats,setNames)
+importFrom(utils,head)
 importFrom(Rcpp,evalCpp)
 useDynLib(TFRegAct, .registration = TRUE)
 

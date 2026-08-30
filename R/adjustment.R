@@ -214,8 +214,6 @@ find_adjustment_dagitty_make_node_map <- function(nodes) {
 }
 
 find_adjustment_dagitty_direct_distance_map <- function(graph, target_node) {
-  suppressPackageStartupMessages(library(igraph))
-
   if (!target_node %in% igraph::V(graph)$name) {
     stop(sprintf("Target node '%s' not found in graph.", target_node))
   }
@@ -237,8 +235,6 @@ find_adjustment_dagitty_direct_distance_map <- function(graph, target_node) {
 }
 
 find_adjustment_dagitty_build_local_dag <- function(edges, tf_query, gene_query, graph = NULL, reverse_graph = NULL) {
-  suppressPackageStartupMessages(library(igraph))
-
   g <- if (is.null(graph)) {
     igraph::graph_from_data_frame(edges[, c("tf", "target"), drop = FALSE], directed = TRUE)
   } else {
@@ -442,7 +438,6 @@ find_adjustment_dagitty_best_path_metric <- function(tree_info, from_node) {
 }
 
 find_adjustment_dagitty_build_distance_graph <- function(edges) {
-  suppressPackageStartupMessages(library(data.table))
   edge_dt <- data.table::as.data.table(edges[, c("tf", "target", "confidence_score"), drop = FALSE])
   edge_dt[, node1 := ifelse(tf <= target, tf, target)]
   edge_dt[, node2 := ifelse(tf <= target, target, tf)]
@@ -452,7 +447,6 @@ find_adjustment_dagitty_build_distance_graph <- function(edges) {
     by = .(node1, node2)
   ]
   collapsed[!is.finite(confidence_score), confidence_score := 0L]
-  suppressPackageStartupMessages(library(igraph))
   graph <- igraph::graph_from_data_frame(
     collapsed[, .(from = node1, to = node2, confidence_score)],
     directed = FALSE
@@ -801,8 +795,6 @@ find_adjustment_dagitty_run <- function(
   write_files = TRUE
 ) {
   find_adjustment_dagitty_install_if_missing("igraph")
-  suppressPackageStartupMessages(library(igraph))
-
   tf_query <- trimws(as.character(tf))
   gene_query <- trimws(as.character(gene))
   if (!nzchar(tf_query) || !nzchar(gene_query)) {

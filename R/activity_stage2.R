@@ -19,8 +19,7 @@ build_TF_EM_stage2_input <- function(
   output_file = NULL
 ) {
   nuisance_storage <- match.arg(nuisance_storage)
-  expected_model_version <-
-    "stage1_normal_condition_interaction_stage2_ready_v2"
+  expected_model_version <- tf_shared_stage2_model_version()
   if (!is.list(stage1_filtered_results) || !length(stage1_filtered_results)) {
     tf_em_stage2_input_stop(
       "`stage1_filtered_results` must contain at least one retained gene."
@@ -69,6 +68,7 @@ build_TF_EM_stage2_input <- function(
   }
   cell_names <- as.character(first_input$cell_names)
   condition <- as.integer(first_input$stan_data$condition)
+  has_condition <- isTRUE(first_input$condition_model)
   target_tf_expression <- as.numeric(first_input$target_tf_expression)
   N <- length(cell_names)
   G <- length(target_genes)
@@ -78,6 +78,16 @@ build_TF_EM_stage2_input <- function(
       any(target_tf_expression < 0)) {
     tf_em_stage2_input_stop(
       "The target-TF expression vector must contain one finite nonnegative value per cell."
+    )
+  }
+  if (has_condition && !identical(sort(unique(condition)), 0:1)) {
+    tf_em_stage2_input_stop(
+      "Condition-enabled activity inference requires both coded condition levels."
+    )
+  }
+  if (!has_condition && any(condition != 0L)) {
+    tf_em_stage2_input_stop(
+      "Condition-free activity inference must use an all-zero condition vector."
     )
   }
 
@@ -152,6 +162,7 @@ build_TF_EM_stage2_input <- function(
       )
     }
     if (!identical(as.character(input$cell_names), cell_names) ||
+        !identical(isTRUE(input$condition_model), has_condition) ||
         !identical(as.integer(input$stan_data$condition), condition)) {
       tf_em_stage2_input_stop(
         "Cell order or condition coding differs for retained gene `%s`.", gene
@@ -181,7 +192,7 @@ build_TF_EM_stage2_input <- function(
       )
     }
     use_batch <- if (is.null(input$use_batch)) {
-      !is.null(input$stan_data$K_batch)
+      !is.null(input$stan_data$K_batch) && input$stan_data$K_batch > 0L
     } else {
       isTRUE(input$use_batch)
     }
@@ -241,10 +252,12 @@ build_TF_EM_stage2_input <- function(
       as.numeric(draws$phi[selected_draw_ids])
     }
     eta0 <- sweep(eta0, 1L, alpha_nuisance, FUN = "+")
-    eta0 <- eta0 + tcrossprod(
-      condition_nuisance,
-      as.numeric(input$stan_data$condition)
-    )
+    if (has_condition) {
+      eta0 <- eta0 + tcrossprod(
+        condition_nuisance,
+        as.numeric(input$stan_data$condition) - 0.5
+      )
+    }
     if (use_batch) {
       batch_contribution <- matrix(
         batch_nuisance[
@@ -273,9 +286,21 @@ build_TF_EM_stage2_input <- function(
     eta0_draws[, , g] <- eta0
     phi_draws[, g] <- phi_nuisance
     beta_target_mean_init[[g]] <- target_row$beta_mean[[1]]
-    beta_target_delta_init[[g]] <- target_row$beta_delta_mean[[1]]
-    beta_target_control_init[[g]] <- target_row$beta_control_mean[[1]]
-    beta_target_disease_init[[g]] <- target_row$beta_disease_mean[[1]]
+    beta_target_delta_init[[g]] <- if (has_condition) {
+      target_row$beta_delta_mean[[1]]
+    } else {
+      0
+    }
+    beta_target_control_init[[g]] <- if (has_condition) {
+      target_row$beta_control_mean[[1]]
+    } else {
+      target_row$beta_mean[[1]]
+    }
+    beta_target_disease_init[[g]] <- if (has_condition) {
+      target_row$beta_disease_mean[[1]]
+    } else {
+      target_row$beta_mean[[1]]
+    }
     beta_prior_mean[[g]] <- draws$beta_prior_mean[[target_name]]
     beta_prior_sd[[g]] <- draws$beta_prior_sd[[target_name]]
     target_interaction_sd[[g]] <- draws$target_interaction_sd
@@ -300,7 +325,7 @@ build_TF_EM_stage2_input <- function(
   }
 
   result <- list(
-    interface_version = "tf_em_stage2_input_v1",
+    interface_version = "tf_em_stage2_input_v3",
     pipeline_stage = "em_input",
     model_version = expected_model_version,
     target_tf = first_input$target_tf,
@@ -312,6 +337,7 @@ build_TF_EM_stage2_input <- function(
     nuisance_storage = nuisance_storage,
     cell_names = cell_names,
     target_genes = target_genes,
+    has_condition = has_condition,
     condition = condition,
     control_level = first_input$control_level,
     disease_level = first_input$disease_level,

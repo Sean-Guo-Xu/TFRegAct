@@ -71,24 +71,28 @@ prepare_TF_stage1_screening_stan_data <- function(
     fitted_expr <- sweep(fitted_expr, 1L, predictor_scale[fitted_index], "/")
   }
 
-  use_batch <- !is.null(analysis_object$batch)
-  batch_factor <- if (use_batch) {
-    batch_values <- trimws(as.character(analysis_object$batch))
-    if (any(is.na(batch_values)) || any(!nzchar(batch_values))) {
-      tf_stage1_input_stop("Batch contains missing or empty labels.")
-    }
-    droplevels(as.factor(batch_values))
-  } else {
-    NULL
+  if (!is.numeric(batch_prior_scale) || length(batch_prior_scale) != 1L ||
+      !is.finite(batch_prior_scale) || batch_prior_scale <= 0) {
+    tf_stage1_input_stop("`batch_prior_scale` must be one finite positive number.")
   }
-  condition <- tf_condition_from_sample(
+  if (!is.numeric(target_interaction_sd) ||
+      length(target_interaction_sd) != 1L ||
+      !is.finite(target_interaction_sd) || target_interaction_sd <= 0) {
+    tf_stage1_input_stop("`target_interaction_sd` must be one finite positive number.")
+  }
+
+  nuisance <- tf_prepare_nuisance_design(
     analysis_object = analysis_object,
     control_level = control_level,
-    disease_level = disease_level
+    disease_level = disease_level,
+    nuisance_prior_scale = 1
   )
-  if (is.null(condition)) {
-    tf_stage1_input_stop("A two-level sample factor is required for condition interaction.")
+  batch_columns <- grep("^batch_contrast_", nuisance$W_names)
+  if (length(batch_columns)) {
+    nuisance$W_prior_scale[batch_columns] <- as.numeric(batch_prior_scale)
   }
+  use_target_interaction <- isTRUE(nuisance$has_condition)
+
   libsize <- as.numeric(analysis_object$libsize)
   if (length(libsize) != ncol(expr) || any(!is.finite(libsize)) || any(libsize <= 0)) {
     tf_stage1_input_stop("Library sizes must be finite, positive, and cell-aligned.")
@@ -99,21 +103,32 @@ prepare_TF_stage1_screening_stan_data <- function(
     P = length(fitted_index),
     Y = as.array(as.integer(analysis_object$Y_exp)),
     X = t(fitted_expr),
-    condition = as.array(as.integer(condition)),
+    Q = as.integer(nuisance$Q),
+    W = nuisance$W,
+    W_prior_scale = as.vector(nuisance$W_prior_scale),
+    has_condition = as.integer(nuisance$has_condition),
+    condition_w_index = nuisance$condition_w_index,
+    condition = as.array(nuisance$condition),
+    K_batch = nuisance$K_batch,
+    batch = as.array(nuisance$batch),
+    batch_level_design = nuisance$batch_level_design,
     log_offset = as.vector(log(libsize / mean(libsize))),
     confidence = as.vector(confidence[fitted_index]),
     direction = as.array(direction[fitted_index]),
+    gamma = as.numeric(beta_prior_scale),
     beta_prior_scale = as.numeric(beta_prior_scale),
     eta = as.numeric(eta),
     r_dir = as.numeric(r_dir),
+    alpha_prior_sd = 2,
     target_tf_index = as.integer(match(target_match, fitted_index)),
+    use_target_interaction = as.integer(use_target_interaction),
+    target_condition_centered = if (use_target_interaction) {
+      as.numeric(nuisance$condition) - 0.5
+    } else {
+      rep(0, ncol(expr))
+    },
     target_interaction_sd = as.numeric(target_interaction_sd)
   )
-  if (use_batch) {
-    stan_data$K_batch <- nlevels(batch_factor)
-    stan_data$batch <- as.array(as.integer(batch_factor))
-    stan_data$batch_prior_scale <- as.numeric(batch_prior_scale)
-  }
   list(
     status = "ready",
     target_tf = target_tf,
@@ -121,10 +136,12 @@ prepare_TF_stage1_screening_stan_data <- function(
     target_tf_index = match(target_match, fitted_index),
     feature_names = feature_names[fitted_index],
     cell_names = colnames(expr),
-    use_batch = use_batch,
-    batch_levels = if (use_batch) levels(batch_factor) else character(0),
-    control_level = attr(condition, "control_level"),
-    disease_level = attr(condition, "disease_level"),
+    use_batch = nuisance$use_batch,
+    batch_levels = nuisance$batch_levels,
+    W_names = nuisance$W_names,
+    condition_model = nuisance$has_condition,
+    control_level = nuisance$control_level,
+    disease_level = nuisance$disease_level,
     predictor_center = stats::setNames(predictor_center[fitted_index], feature_names[fitted_index]),
     predictor_scale = stats::setNames(predictor_scale[fitted_index], feature_names[fitted_index]),
     target_tf_expression = as.numeric(expr[target_match, ]),
@@ -426,9 +443,20 @@ build_TF_stage1_screening_input <- function(
   }
   class(result) <- c("TFStage1ScreeningInputList", "list")
   attr(result, "target_tf") <- target_tf
-  attr(result, "model_version") <- "stage1_normal_condition_interaction_stage2_ready_v2"
+  ready_entries <- result[vapply(
+    result,
+    function(entry) is.list(entry) && identical(entry$status, "ready"),
+    logical(1)
+  )]
+  input_use_batch <- length(ready_entries) > 0L &&
+    isTRUE(ready_entries[[1]]$use_batch)
+  input_has_condition <- length(ready_entries) > 0L &&
+    isTRUE(ready_entries[[1]]$condition_model)
+
+  attr(result, "model_version") <- tf_shared_stage2_model_version()
   attr(result, "prior_family") <- "normal"
-  attr(result, "condition_interaction") <- TRUE
+  attr(result, "has_condition") <- input_has_condition
+  attr(result, "condition_interaction") <- input_has_condition
   attr(result, "stage2_interface_ready") <- TRUE
   attr(result, "directional_prior") <- TRUE
   attr(result, "edge_direction_included") <- TRUE
@@ -436,7 +464,7 @@ build_TF_stage1_screening_input <- function(
   attr(result, "recursive_adjustment_search") <- TRUE
   attr(result, "cell_count") <- ncol(seurat_obj)
   attr(result, "batch_column") <- batch_column
-  attr(result, "use_batch") <- !is.null(batch_column)
+  attr(result, "use_batch") <- input_use_batch
   attr(result, "condition_column") <- condition_column
   attr(result, "confidence_threshold") <- attr(direct_target_edges, "query_summary")$confidence_threshold
   attr(result, "confounder_confidence_threshold") <- attr(adjustment_results, "confounder_confidence_threshold")
@@ -445,11 +473,7 @@ build_TF_stage1_screening_input <- function(
   attr(result, "search_seed") <- attr(adjustment_results, "search_seed")
   attr(result, "r_dir") <- as.numeric(r_dir)
   attr(result, "target_interaction_sd") <- as.numeric(target_interaction_sd)
-  attr(result, "stan_file") <- if (is.null(batch_column)) {
-    "TF_bayesian_screening_stage1_nb_model_nobatch.stan"
-  } else {
-    "TF_bayesian_screening_stage1_nb_model.stan"
-  }
+  attr(result, "stan_file") <- "TF_stage2_directional_nb_model.stan"
 
   summary <- do.call(rbind, lapply(result, function(entry) {
     data.frame(

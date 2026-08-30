@@ -37,7 +37,8 @@
 #' Supply exactly one input dataset: `seurat_obj` (an in-memory Seurat object)
 #' or `data_file` (an .RData file containing an object named `pbmc`). The Seurat
 #' object must contain the requested assay/layer and metadata columns for
-#' `cell_column`, `condition_column`, and, when used, `batch_column`.
+#' `cell_column` and, when used, `condition_column` and `batch_column`. Set
+#' `condition_column = NULL` for condition-free activity inference.
 #' `output = FALSE` returns all results in memory and removes intermediate files.
 #' `output = TRUE` writes `<TF>_output` below the current working directory.
 #' A character `output` is used as the output directory directly.
@@ -78,6 +79,10 @@ TF_activity_computation <- function(
   prescreen_confounder_interval = 0.90,
   prescreen_variational_iter = 10000L,
   prescreen_output_samples = 2000L,
+  direction_effect = 0.2,
+  beta_sd_floor = 0.5,
+  stage1_sd_multiplier = 1.5,
+  stage2_alpha_prior_sd = 1,
   mcmc_target_interval = 0.90,
   mcmc_confounder_interval = 0.90,
   mcmc_chains = 3L,
@@ -87,6 +92,7 @@ TF_activity_computation <- function(
   mcmc_max_treedepth = 12L,
   mcmc_draws_for_em = 1500L,
   nuisance_draw_count = 100L,
+  active_prior_zero = 0.2,
   em_control = list(),
   resume = TRUE,
   force_refit = FALSE,
@@ -144,7 +150,7 @@ TF_activity_computation <- function(
   input_build_elapsed_seconds <- as.numeric(difftime(Sys.time(), input_build_started, units = "secs"))
 
   pipeline_started <- Sys.time()
-  pipeline_result <- run_TF_three_stage_pipeline(screening_input = screening_input, output_dir = work_dir, cores = cores, seed = seed, prescreen_target_interval = prescreen_target_interval, prescreen_confounder_interval = prescreen_confounder_interval, prescreen_variational_iter = prescreen_variational_iter, prescreen_output_samples = prescreen_output_samples, mcmc_target_interval = mcmc_target_interval, mcmc_confounder_interval = mcmc_confounder_interval, mcmc_chains = mcmc_chains, mcmc_iter_warmup = mcmc_iter_warmup, mcmc_iter_sampling = mcmc_iter_sampling, mcmc_adapt_delta = mcmc_adapt_delta, mcmc_max_treedepth = mcmc_max_treedepth, mcmc_draws_for_em = mcmc_draws_for_em, nuisance_draw_count = nuisance_draw_count, em_control = em_control, resume = resume, force_refit = force_refit, force_recompile = force_recompile)
+  pipeline_result <- run_TF_three_stage_pipeline(screening_input = screening_input, output_dir = work_dir, cores = cores, seed = seed, prescreen_target_interval = prescreen_target_interval, prescreen_confounder_interval = prescreen_confounder_interval, prescreen_variational_iter = prescreen_variational_iter, prescreen_output_samples = prescreen_output_samples, direction_effect = direction_effect, beta_sd_floor = beta_sd_floor, stage1_sd_multiplier = stage1_sd_multiplier, stage2_alpha_prior_sd = stage2_alpha_prior_sd, mcmc_target_interval = mcmc_target_interval, mcmc_confounder_interval = mcmc_confounder_interval, mcmc_chains = mcmc_chains, mcmc_iter_warmup = mcmc_iter_warmup, mcmc_iter_sampling = mcmc_iter_sampling, mcmc_adapt_delta = mcmc_adapt_delta, mcmc_max_treedepth = mcmc_max_treedepth, mcmc_draws_for_em = mcmc_draws_for_em, nuisance_draw_count = nuisance_draw_count, active_prior_zero = active_prior_zero, em_control = em_control, resume = resume, force_refit = force_refit, force_recompile = force_recompile)
   pipeline_elapsed_seconds <- as.numeric(difftime(Sys.time(), pipeline_started, units = "secs"))
 
   activity_column <- paste0(target_tf, "_activity_A")
@@ -161,8 +167,10 @@ TF_activity_computation <- function(
     utils::write.csv(pipeline_result$em_fit$activity_summary, file.path(work_dir, paste0(target_tf, "_stage3_activity_by_cell.csv")), row.names = FALSE)
     utils::write.csv(pipeline_result$em_fit$beta_summary, file.path(work_dir, paste0(target_tf, "_stage3_target_beta_summary.csv")), row.names = FALSE)
     utils::write.csv(pipeline_result$em_fit$convergence_summary, file.path(work_dir, paste0(target_tf, "_stage3_em_convergence.csv")), row.names = FALSE)
-    utils::write.csv(pipeline_result$em_fit$activity_condition_difference_by_draw, file.path(work_dir, paste0(target_tf, "_stage3_activity_difference_by_draw.csv")), row.names = FALSE)
-    utils::write.csv(pipeline_result$em_fit$activity_condition_difference_summary, file.path(work_dir, paste0(target_tf, "_stage3_activity_difference_summary.csv")), row.names = FALSE)
+    if (isTRUE(pipeline_result$em_fit$has_condition)) {
+      utils::write.csv(pipeline_result$em_fit$activity_condition_difference_by_draw, file.path(work_dir, paste0(target_tf, "_stage3_activity_difference_by_draw.csv")), row.names = FALSE)
+      utils::write.csv(pipeline_result$em_fit$activity_condition_difference_summary, file.path(work_dir, paste0(target_tf, "_stage3_activity_difference_summary.csv")), row.names = FALSE)
+    }
     saveRDS(pbmc, file.path(work_dir, paste0(target_tf, "_stage3_activity_seurat.rds")))
     utils::write.csv(overall_timing, file.path(work_dir, paste0(target_tf, "_pipeline_timing.csv")), row.names = FALSE)
   } else {

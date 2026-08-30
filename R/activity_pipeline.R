@@ -44,6 +44,10 @@ run_TF_three_stage_pipeline <- function(
   prescreen_confounder_interval = 0.90,
   prescreen_variational_iter = 10000L,
   prescreen_output_samples = 2000L,
+  direction_effect = 0.2,
+  beta_sd_floor = 0.5,
+  stage1_sd_multiplier = 1.5,
+  stage2_alpha_prior_sd = 1,
   mcmc_target_interval = 0.90,
   mcmc_confounder_interval = 0.90,
   mcmc_chains = 3L,
@@ -53,6 +57,7 @@ run_TF_three_stage_pipeline <- function(
   mcmc_max_treedepth = 12L,
   mcmc_draws_for_em = 1000L,
   nuisance_draw_count = 0L,
+  active_prior_zero = 0.2,
   em_control = list(),
   resume = TRUE,
   force_refit = FALSE,
@@ -134,6 +139,10 @@ run_TF_three_stage_pipeline <- function(
   mcmc_input <- build_TF_mcmc_input_from_prescreen(
     prescreen_filtered_results = prescreen_filtered,
     screening_input = screening_input,
+    direction_effect = direction_effect,
+    beta_sd_floor = beta_sd_floor,
+    stage1_sd_multiplier = stage1_sd_multiplier,
+    alpha_prior_sd = stage2_alpha_prior_sd,
     output_file = paths$mcmc_input
   )
 
@@ -174,8 +183,24 @@ run_TF_three_stage_pipeline <- function(
   mcmc_elapsed_seconds <- as.numeric(difftime(
     Sys.time(), mcmc_started, units = "secs"
   ))
+  if (!length(mcmc_filtered)) {
+    tf_three_stage_stop(
+      paste0(
+        "No target-gene models passed Stage 2 MCMC filtering. ",
+        "Inspect `%s` for fit failures or unsupported target-TF effects."
+      ),
+      paths$mcmc_gene_summary
+    )
+  }
 
   nuisance_draw_count <- as.integer(nuisance_draw_count[[1]])
+  active_prior_zero <- as.numeric(active_prior_zero[[1]])
+  if (!is.finite(active_prior_zero) || active_prior_zero <= 0 ||
+      active_prior_zero >= 0.9) {
+    tf_three_stage_stop(
+      "`active_prior_zero` must be a finite number strictly between 0 and 0.9."
+    )
+  }
   nuisance_storage <- if (nuisance_draw_count == 0L) {
     "posterior_mean"
   } else {
@@ -223,9 +248,7 @@ run_TF_three_stage_pipeline <- function(
     nuisance_draw_ids = if (nuisance_draw_count == 0L) NULL else seq_len(nuisance_draw_count),
     cores = cores,
     kappa = 1,
-    active_prior_zero = 0.1,
-    active_prior_positive = 0.9,
-    hard_zero_expression = TRUE,
+    active_prior_zero = active_prior_zero,
     quadrature_nodes = 21L,
     max_iter = 30L,
     min_iter = 2L,
@@ -240,7 +263,8 @@ run_TF_three_stage_pipeline <- function(
     save_traces = TRUE
   )
   duplicated_arguments <- intersect(names(em_control), c(
-    "stage2_input", "output_file", "checkpoint_file"
+    "stage2_input", "output_file", "checkpoint_file",
+    "active_prior_zero", "active_prior_positive", "hard_zero_expression"
   ))
   if (length(duplicated_arguments)) {
     tf_three_stage_stop(

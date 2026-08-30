@@ -4,9 +4,32 @@
   if (!is.character(stan_file) || length(stan_file) != 1L || !nzchar(stan_file)) {
     stop("`stan_file` must be one non-empty file name or path.", call. = FALSE)
   }
-  if (file.exists(stan_file)) return(normalizePath(stan_file, winslash = "/", mustWork = TRUE))
+  # A bare model name denotes a package model. Prefer the development/package
+  # copy before looking in the working directory, where legacy scripts may
+  # contain an older Stan file with the same basename. Explicit paths retain
+  # their normal override behavior.
+  is_bare_name <- identical(dirname(stan_file), ".") &&
+    identical(basename(stan_file), stan_file)
+  if (!is_bare_name && file.exists(stan_file)) {
+    return(normalizePath(stan_file, winslash = "/", mustWork = TRUE))
+  }
+  development_candidates <- c(
+    file.path(getwd(), "inst", "stan", basename(stan_file)),
+    file.path(getwd(), "TFRegAct", "inst", "stan", basename(stan_file))
+  )
+  development_match <- development_candidates[file.exists(development_candidates)]
+  if (length(development_match)) {
+    return(normalizePath(
+      development_match[[1]],
+      winslash = "/",
+      mustWork = TRUE
+    ))
+  }
   packaged <- system.file("stan", basename(stan_file), package = "TFRegAct")
   if (nzchar(packaged) && file.exists(packaged)) return(normalizePath(packaged, winslash = "/", mustWork = TRUE))
+  if (file.exists(stan_file)) {
+    return(normalizePath(stan_file, winslash = "/", mustWork = TRUE))
+  }
   stop(sprintf("Stan model `%s` was not found in the package or at the supplied path.", stan_file), call. = FALSE)
 }
 

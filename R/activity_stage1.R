@@ -25,29 +25,14 @@ tf_stage1_screening_resolve_stan_file <- function(
   stan_file,
   prior_family
 ) {
-  input_use_batch <- attr(screening_input, "use_batch")
-  use_batch <- if (is.null(input_use_batch)) {
-    is.list(screening_input[[1]]) &&
-      !is.null(screening_input[[1]]$stan_data$K_batch)
-  } else {
-    isTRUE(input_use_batch)
-  }
   if (is.null(stan_file) || !nzchar(as.character(stan_file[[1]]))) {
     stan_file <- if (identical(prior_family, "laplace")) {
-      if (use_batch) {
-        "TF_bayesian_prescreen_laplace_nb_model.stan"
-      } else {
-        "TF_bayesian_prescreen_laplace_nb_model_nobatch.stan"
-      }
+      "TF_directional_nb_model.stan"
     } else {
       input_stan_file <- attr(screening_input, "stan_file")
       if (is.null(input_stan_file) ||
           !nzchar(as.character(input_stan_file[[1]]))) {
-        if (use_batch) {
-          "TF_bayesian_screening_stage1_nb_model.stan"
-        } else {
-          "TF_bayesian_screening_stage1_nb_model_nobatch.stan"
-        }
+        "TF_stage2_directional_nb_model.stan"
       } else {
         input_stan_file
       }
@@ -83,11 +68,21 @@ tf_stage1_screening_input_signature <- function(screening_input, ready_genes) {
       entry$stan_data$N,
       entry$stan_data$P,
       entry$stan_data$target_tf_index,
+      entry$stan_data$has_condition,
+      entry$stan_data$use_target_interaction,
       sum(entry$stan_data$condition == 0L),
       sum(entry$stan_data$condition == 1L),
-      entry$stan_data$beta_prior_scale,
-      entry$stan_data$eta,
-      entry$stan_data$r_dir,
+      if (!is.null(entry$stan_data$beta_prior_mean)) {
+        paste(signif(entry$stan_data$beta_prior_mean, 12), collapse = ",")
+      } else {
+        entry$stan_data$beta_prior_scale
+      },
+      if (!is.null(entry$stan_data$beta_prior_sd)) {
+        paste(signif(entry$stan_data$beta_prior_sd, 12), collapse = ",")
+      } else {
+        entry$stan_data$eta
+      },
+      if (is.null(entry$stan_data$r_dir)) NA_real_ else entry$stan_data$r_dir,
       entry$stan_data$target_interaction_sd,
       paste(entry$feature_names, collapse = ","),
       sep = "|"
@@ -114,12 +109,12 @@ tf_stage1_screening_validate_input <- function(screening_input) {
   }
   if (!identical(
     attr(screening_input, "model_version"),
-    "stage1_normal_condition_interaction_stage2_ready_v2"
+    tf_shared_stage2_model_version()
   )) {
     tf_stage1_screening_stop(
       paste0(
-        "`screening_input` is not the Normal-prior condition-interaction ",
-        "Stage 1 object prepared for the EM Stage 2 interface. Rebuild the Stage 1 input first."
+        "`screening_input` uses an obsolete model contract. ",
+        "Rebuild the activity screening input before fitting."
       )
     )
   }
@@ -157,11 +152,24 @@ tf_stage1_screening_validate_input <- function(screening_input) {
       )
     }
     required_stan_fields <- c(
-      "condition", "target_tf_index", "target_interaction_sd"
+      "Q", "W", "W_prior_scale", "has_condition", "condition_w_index", "condition",
+      "K_batch", "batch", "batch_level_design", "target_tf_index",
+      "use_target_interaction", "target_condition_centered",
+      "target_interaction_sd"
     )
+    if (identical(attr(screening_input, "pipeline_stage"), "mcmc_input")) {
+      required_stan_fields <- c(
+        required_stan_fields,
+        "beta_prior_mean", "beta_prior_sd", "alpha_prior_sd"
+      )
+    }
     if (!all(required_stan_fields %in% names(entry$stan_data)) ||
+        nrow(entry$stan_data$W) != entry$stan_data$N ||
+        ncol(entry$stan_data$W) != entry$stan_data$Q ||
+        length(entry$stan_data$W_prior_scale) != entry$stan_data$Q ||
         length(entry$stan_data$condition) != entry$stan_data$N ||
         !all(entry$stan_data$condition %in% c(0L, 1L)) ||
+        length(entry$stan_data$target_condition_centered) != entry$stan_data$N ||
         !identical(
           as.integer(entry$stan_data$target_tf_index),
           as.integer(entry$target_tf_index)
@@ -171,19 +179,57 @@ tf_stage1_screening_validate_input <- function(screening_input) {
         gene
       )
     }
+    has_condition <- identical(as.integer(entry$stan_data$has_condition), 1L)
+    use_interaction <- identical(
+      as.integer(entry$stan_data$use_target_interaction),
+      1L
+    )
+    if (has_condition) {
+      if (entry$stan_data$condition_w_index < 1L ||
+          entry$stan_data$condition_w_index > entry$stan_data$Q) {
+        tf_stage1_screening_stop(
+          "Invalid condition column for target gene `%s`.",
+          gene
+        )
+      }
+    } else if (entry$stan_data$condition_w_index != 0L ||
+               any(entry$stan_data$condition != 0L)) {
+      tf_stage1_screening_stop(
+        "Invalid condition-off encoding for target gene `%s`.",
+        gene
+      )
+    }
+    if (use_interaction && !has_condition) {
+      tf_stage1_screening_stop(
+        "Target interaction requires condition for target gene `%s`.",
+        gene
+      )
+    }
+    if (!use_interaction && any(entry$stan_data$target_condition_centered != 0)) {
+      tf_stage1_screening_stop(
+        "Interaction-off input must be zero for target gene `%s`.",
+        gene
+      )
+    }
     entry_use_batch <- if (is.null(entry$use_batch)) {
-      !is.null(entry$stan_data$K_batch)
+      !is.null(entry$stan_data$K_batch) && entry$stan_data$K_batch > 0L
     } else {
       isTRUE(entry$use_batch)
     }
     if (entry_use_batch) {
-      if (!all(c("K_batch", "batch", "batch_prior_scale") %in% names(entry$stan_data)) ||
-          length(entry$stan_data$batch) != entry$stan_data$N ||
-          entry$stan_data$K_batch < 1L) {
+      if (length(entry$stan_data$batch) != entry$stan_data$N ||
+          entry$stan_data$K_batch < 2L ||
+          any(entry$stan_data$batch < 1L) ||
+          any(entry$stan_data$batch > entry$stan_data$K_batch) ||
+          nrow(entry$stan_data$batch_level_design) != entry$stan_data$K_batch ||
+          ncol(entry$stan_data$batch_level_design) != entry$stan_data$Q) {
         tf_stage1_screening_stop("Invalid batch data for target gene `%s`.", gene)
       }
-    } else if (any(c("K_batch", "batch", "batch_prior_scale") %in% names(entry$stan_data))) {
-      tf_stage1_screening_stop("No-batch input `%s` contains batch Stan data.", gene)
+    } else if (entry$stan_data$K_batch != 0L ||
+               any(entry$stan_data$batch != 0L) ||
+               nrow(entry$stan_data$batch_level_design) != 0L ||
+               ncol(entry$stan_data$batch_level_design) != entry$stan_data$Q) {
+      tf_stage1_screening_stop("Invalid zero-batch encoding for `%s`.", gene)
     }
   }
   ready
@@ -200,7 +246,7 @@ tf_stage1_screening_summarize_fit <- function(
 ) {
   P <- entry$stan_data$P
   use_batch <- if (is.null(entry$use_batch)) {
-    !is.null(entry$stan_data$K_batch)
+    !is.null(entry$stan_data$K_batch) && entry$stan_data$K_batch > 0L
   } else {
     isTRUE(entry$use_batch)
   }
@@ -301,26 +347,22 @@ tf_stage1_screening_summarize_fit <- function(
     quantiles[j, interval_column(interval_level[[j]], lower = FALSE)]
   }, numeric(1))
 
-  prior_scale <- entry$stan_data$beta_prior_scale *
-    (entry$stan_data$confidence / 10) ^ entry$stan_data$eta
   if (identical(prior_family, "laplace")) {
-    prior_mean <- ifelse(
-      entry$stan_data$direction == 0L,
-      0,
-      entry$stan_data$direction *
-        log((1 + entry$stan_data$r_dir) / 2) * prior_scale
-    )
-    prior_sd <- sqrt(2) * prior_scale
+    prior_scale <- entry$stan_data$beta_prior_scale *
+      (entry$stan_data$confidence / 10) ^ entry$stan_data$eta
+    directional <- entry$stan_data$direction != 0L
+    prior_mean <- numeric(length(prior_scale))
+    prior_mean[directional] <-
+      entry$stan_data$direction[directional] *
+      prior_scale[directional] *
+      (entry$stan_data$r_dir - 1) / entry$stan_data$r_dir
+    prior_sd <- rep(sqrt(2), length(prior_scale)) * prior_scale
+    prior_sd[directional] <- prior_scale[directional] *
+      sqrt(1 + 1 / entry$stan_data$r_dir ^ 2)
   } else {
-    direction_z <- stats::qnorm(
-      entry$stan_data$r_dir / (1 + entry$stan_data$r_dir)
-    )
-    prior_mean <- ifelse(
-      entry$stan_data$direction == 0L,
-      0,
-      entry$stan_data$direction * direction_z * prior_scale
-    )
-    prior_sd <- prior_scale
+    prior_mean <- as.numeric(entry$stan_data$beta_prior_mean)
+    prior_sd <- as.numeric(entry$stan_data$beta_prior_sd)
+    prior_scale <- prior_sd
   }
   parameter_table <- data.frame(
     variable = beta_variables,
@@ -467,8 +509,16 @@ tf_stage1_screening_summarize_fit <- function(
     } else {
       NA_integer_
     },
-    control_cells = sum(entry$stan_data$condition == 0L),
-    disease_cells = sum(entry$stan_data$condition == 1L)
+    control_cells = if (entry$stan_data$has_condition == 1L) {
+      sum(entry$stan_data$condition == 0L)
+    } else {
+      NA_integer_
+    },
+    disease_cells = if (entry$stan_data$has_condition == 1L) {
+      sum(entry$stan_data$condition == 1L)
+    } else {
+      NA_integer_
+    }
   )
 
   list(
@@ -482,10 +532,13 @@ tf_stage1_screening_summarize_fit <- function(
 tf_stage1_screening_fit_one <- function(job, sampling) {
   started <- Sys.time()
   entry <- job$entry
+  failure_stage <- "fit"
   tryCatch({
-    fit <- if (identical(sampling$inference, "mcmc")) {
-      .tf_stage1_worker_model$sample(
-        data = entry$stan_data,
+    fit <- if (identical(sampling$prior_family, "laplace")) {
+      tf_fit_shared_laplace_stage1(
+        stan_data = entry$stan_data,
+        inference = sampling$inference,
+        model = .tf_stage1_worker_model,
         chains = sampling$chains,
         parallel_chains = 1L,
         iter_warmup = sampling$iter_warmup,
@@ -494,7 +547,22 @@ tf_stage1_screening_fit_one <- function(job, sampling) {
         refresh = sampling$refresh,
         adapt_delta = sampling$adapt_delta,
         max_treedepth = sampling$max_treedepth,
-        save_warmup = FALSE
+        variational_algorithm = sampling$variational_algorithm,
+        variational_iter = sampling$variational_iter,
+        variational_output_samples = sampling$variational_output_samples
+      )
+    } else if (identical(sampling$inference, "mcmc")) {
+      tf_fit_shared_stage2(
+        stan_data = entry$stan_data,
+        model = .tf_stage1_worker_model,
+        chains = sampling$chains,
+        parallel_chains = 1L,
+        iter_warmup = sampling$iter_warmup,
+        iter_sampling = sampling$iter_sampling,
+        seed = sampling$seed + job$model_index + job$retry_seed_offset,
+        refresh = sampling$refresh,
+        adapt_delta = sampling$adapt_delta,
+        max_treedepth = sampling$max_treedepth
       )
     } else {
       .tf_stage1_worker_model$variational(
@@ -506,6 +574,7 @@ tf_stage1_screening_fit_one <- function(job, sampling) {
         output_samples = sampling$variational_output_samples
       )
     }
+    failure_stage <- "summarize posterior"
     summarized <- tf_stage1_screening_summarize_fit(
       fit,
       entry,
@@ -515,7 +584,9 @@ tf_stage1_screening_fit_one <- function(job, sampling) {
       target_interval = sampling$target_interval,
       confounder_interval = sampling$confounder_interval
     )
+    failure_stage <- "retrieve CmdStan output files"
     cmdstan_output_files <- fit$output_files()
+    failure_stage <- "assemble compact result"
     result <- list(
       status = "ok",
       inference = sampling$inference,
@@ -526,6 +597,7 @@ tf_stage1_screening_fit_one <- function(job, sampling) {
       stage2_parameter_draws = summarized$stage2_parameter_draws,
       control_level = entry$control_level,
       disease_level = entry$disease_level,
+      condition_model = isTRUE(entry$condition_model),
       diagnostics = summarized$diagnostics,
       sampling = sampling,
       elapsed_seconds = as.numeric(difftime(Sys.time(), started, units = "secs")),
@@ -568,7 +640,7 @@ tf_stage1_screening_fit_one <- function(job, sampling) {
       diagnostics = NULL,
       sampling = sampling,
       elapsed_seconds = as.numeric(difftime(Sys.time(), started, units = "secs")),
-      error = conditionMessage(error)
+      error = sprintf("%s: %s", failure_stage, conditionMessage(error))
     )
   })
 }
@@ -609,6 +681,19 @@ run_TF_stage1_screening_regressions <- function(
   max_genes = NULL
 ) {
   tf_stage1_screening_require_pkg("cmdstanr")
+  prior_family <- match.arg(
+    as.character(prior_family[[1]]),
+    c("normal", "laplace")
+  )
+  if (identical(prior_family, "normal") &&
+      !identical(attr(screening_input, "pipeline_stage"), "mcmc_input")) {
+    tf_stage1_screening_stop(
+      paste0(
+        "Normal-prior Stage 2 requires the output of ",
+        "`build_TF_mcmc_input_from_prescreen()`."
+      )
+    )
+  }
   ready_genes <- tf_stage1_screening_validate_input(screening_input)
   if (!is.null(max_genes)) {
     max_genes <- suppressWarnings(as.integer(max_genes[[1]]))
@@ -631,10 +716,6 @@ run_TF_stage1_screening_regressions <- function(
   refresh <- suppressWarnings(as.integer(refresh[[1]]))
   max_treedepth <- suppressWarnings(as.integer(max_treedepth[[1]]))
   inference <- match.arg(as.character(inference[[1]]), c("mcmc", "variational"))
-  prior_family <- match.arg(
-    as.character(prior_family[[1]]),
-    c("normal", "laplace")
-  )
   target_interval <- as.numeric(target_interval[[1]])
   confounder_interval <- as.numeric(confounder_interval[[1]])
   variational_algorithm <- match.arg(
@@ -752,7 +833,7 @@ run_TF_stage1_screening_regressions <- function(
       identical(attr(result, "stan_file"), stan_file) &&
       identical(
         attr(result, "model_version"),
-        "stage1_normal_condition_interaction_stage2_ready_v2"
+        tf_shared_stage2_model_version()
       ) &&
       identical(result_inference, inference) &&
       inference_settings_match &&
@@ -839,7 +920,7 @@ run_TF_stage1_screening_regressions <- function(
     class(result) <- c("TFStage1ScreeningRegressionList", "list")
     attr(result, "input_signature") <- input_signature
     attr(result, "model_version") <-
-      "stage1_normal_condition_interaction_stage2_ready_v2"
+      tf_shared_stage2_model_version()
     attr(result, "target_tf") <- attr(screening_input, "target_tf")
     attr(result, "stan_file") <- stan_file
     attr(result, "inference") <- inference
@@ -869,12 +950,16 @@ run_TF_stage1_screening_regressions <- function(
 
   if (length(pending_genes)) {
     # Compile exactly once in the main R process before starting workers.
+    worker_stan_file <- if (identical(prior_family, "normal")) {
+      .tfregact_stan_without_log_lik(stan_file)
+    } else {
+      stan_file
+    }
     compiled_model <- cmdstanr::cmdstan_model(
-      stan_file = stan_file,
+      stan_file = worker_stan_file,
       force_recompile = isTRUE(force_recompile)
     )
     worker_exe_file <- compiled_model$exe_file()
-    worker_stan_file <- stan_file
     rm(compiled_model)
 
     cluster <- parallel::makeCluster(worker_count)
@@ -885,6 +970,12 @@ run_TF_stage1_screening_regressions <- function(
         "worker_stan_file",
         "worker_exe_file",
         "tf_stage1_screening_stop",
+        "tf_validate_shared_laplace_stage1_data",
+        "tf_fit_shared_laplace_stage1",
+        "tf_shared_stage2_stop",
+        "tf_shared_stage2_data_fields",
+        "tf_validate_shared_stage2_data",
+        "tf_fit_shared_stage2",
         "tf_stage1_screening_summarize_fit",
         "tf_stage1_screening_fit_one"
       ),

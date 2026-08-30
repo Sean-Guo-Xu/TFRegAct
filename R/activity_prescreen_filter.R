@@ -53,6 +53,8 @@ filter_TF_prescreen_results <- function(
           "Missing or invalid prescreen result."
         },
         target_interval = target_interval,
+        target_overall_interval_lower = NA_real_,
+        target_overall_interval_upper = NA_real_,
         target_control_interval_lower = NA_real_,
         target_control_interval_upper = NA_real_,
         target_disease_interval_lower = NA_real_,
@@ -96,14 +98,26 @@ filter_TF_prescreen_results <- function(
       }
     }
 
-    keep_control <- isTRUE(
+    has_condition <- isTRUE(model$condition_model)
+    keep_overall <- isTRUE(
+      model$target_tf$screening_interval_excludes_zero[[1]]
+    )
+    keep_control <- has_condition && isTRUE(
       model$target_tf$control_interval_excludes_zero[[1]]
     )
-    keep_disease <- isTRUE(
+    keep_disease <- has_condition && isTRUE(
       model$target_tf$disease_interval_excludes_zero[[1]]
     )
-    keep_gene <- keep_control || keep_disease
-    support <- if (keep_control && keep_disease) {
+    keep_gene <- if (has_condition) {
+      keep_control || keep_disease
+    } else {
+      keep_overall
+    }
+    support <- if (!has_condition && keep_overall) {
+      "overall"
+    } else if (!has_condition) {
+      "neither"
+    } else if (keep_control && keep_disease) {
       "both"
     } else if (keep_control) {
       "control_only"
@@ -135,14 +149,18 @@ filter_TF_prescreen_results <- function(
       fit_status = "ok",
       fit_error = NA_character_,
       target_interval = target_interval,
+      target_overall_interval_lower =
+        model$target_tf$screening_interval_lower[[1]],
+      target_overall_interval_upper =
+        model$target_tf$screening_interval_upper[[1]],
       target_control_interval_lower =
-        model$target_tf$beta_control_interval_lower[[1]],
+        if (has_condition) model$target_tf$beta_control_interval_lower[[1]] else NA_real_,
       target_control_interval_upper =
-        model$target_tf$beta_control_interval_upper[[1]],
+        if (has_condition) model$target_tf$beta_control_interval_upper[[1]] else NA_real_,
       target_disease_interval_lower =
-        model$target_tf$beta_disease_interval_lower[[1]],
+        if (has_condition) model$target_tf$beta_disease_interval_lower[[1]] else NA_real_,
       target_disease_interval_upper =
-        model$target_tf$beta_disease_interval_upper[[1]],
+        if (has_condition) model$target_tf$beta_disease_interval_upper[[1]] else NA_real_,
       target_supported_in = support,
       target_gene_retained = keep_gene,
       confounder_interval = confounder_interval,
@@ -218,6 +236,10 @@ filter_TF_prescreen_results <- function(
 build_TF_mcmc_input_from_prescreen <- function(
   prescreen_filtered_results,
   screening_input,
+  direction_effect = 0.2,
+  beta_sd_floor = 0.5,
+  stage1_sd_multiplier = 1.5,
+  alpha_prior_sd = 1,
   output_file = NULL
 ) {
   if (!is.list(prescreen_filtered_results) ||
@@ -228,6 +250,10 @@ build_TF_mcmc_input_from_prescreen <- function(
   }
   if (!is.list(screening_input) || !length(screening_input)) {
     tf_prescreen_stop("`screening_input` must be a non-empty nested list.")
+  }
+  if (!is.numeric(alpha_prior_sd) || length(alpha_prior_sd) != 1L ||
+      !is.finite(alpha_prior_sd) || alpha_prior_sd <= 0) {
+    tf_prescreen_stop("`alpha_prior_sd` must be one finite positive number.")
   }
 
   target_genes <- names(prescreen_filtered_results)
@@ -274,6 +300,41 @@ build_TF_mcmc_input_from_prescreen <- function(
     entry$stan_data$P <- length(keep_index)
     entry$target_tf_index <- match(old_target_index, keep_index)
     entry$stan_data$target_tf_index <- entry$target_tf_index
+
+    stage1_table <- rbind(selection$target_tf, selection$confounders)
+    stage1_index <- match(toupper(entry$feature_names), toupper(stage1_table$tf))
+    if (anyNA(stage1_index) ||
+        !all(c("beta_mean", "beta_sd") %in% names(stage1_table))) {
+      tf_prescreen_stop(
+        "Stage 1 posterior summaries are incomplete for `%s`.", gene
+      )
+    }
+    stage1_summary <- stage1_table[stage1_index, , drop = FALSE]
+    stage2_prior <- tf_stage2_prior_from_stage1(
+      stage1_beta_mean = stage1_summary$beta_mean,
+      stage1_beta_sd = stage1_summary$beta_sd,
+      direction = entry$stan_data$direction,
+      direction_effect = direction_effect,
+      beta_sd_floor = beta_sd_floor,
+      stage1_sd_multiplier = stage1_sd_multiplier
+    )
+    entry$stan_data$beta_prior_mean <- stage2_prior$beta_prior_mean
+    entry$stan_data$beta_prior_sd <- stage2_prior$beta_prior_sd
+    entry$stan_data$beta_init <- stage2_prior$stage1_beta_mean
+    entry$stan_data$alpha_prior_sd <- as.numeric(alpha_prior_sd)
+    entry$stage1_beta_summary <- data.frame(
+      tf = entry$feature_names,
+      stage1_beta_mean = stage2_prior$stage1_beta_mean,
+      stage1_beta_sd = stage2_prior$stage1_beta_sd,
+      direction = stage2_prior$direction,
+      stringsAsFactors = FALSE
+    )
+    entry$stage2_prior <- data.frame(
+      tf = entry$feature_names,
+      beta_prior_mean = stage2_prior$beta_prior_mean,
+      beta_prior_sd = stage2_prior$beta_prior_sd,
+      stringsAsFactors = FALSE
+    )
     entry$prescreen_original_predictor_count <- length(keep_index) +
       attr(prescreen_filtered_results, "filter_summary")$
         confounders_removed_by_interval[
@@ -297,18 +358,14 @@ build_TF_mcmc_input_from_prescreen <- function(
     attr(prescreen_filtered_results, "confounder_interval")
   attr(result, "prescreen_filter_counts") <-
     attr(prescreen_filtered_results, "filter_counts")
-  input_use_batch <- attr(screening_input, "use_batch")
-  use_batch <- if (is.null(input_use_batch)) {
-    is.list(screening_input[[1]]) &&
-      !is.null(screening_input[[1]]$stan_data$K_batch)
-  } else {
-    isTRUE(input_use_batch)
-  }
-  attr(result, "stan_file") <- if (use_batch) {
-    "TF_bayesian_screening_stage1_nb_model.stan"
-  } else {
-    "TF_bayesian_screening_stage1_nb_model_nobatch.stan"
-  }
+  attr(result, "model_version") <- tf_shared_stage2_model_version()
+  attr(result, "stan_file") <- "TF_stage2_directional_nb_model.stan"
+  attr(result, "stage2_prior_config") <- list(
+    direction_effect = as.numeric(direction_effect),
+    beta_sd_floor = as.numeric(beta_sd_floor),
+    stage1_sd_multiplier = as.numeric(stage1_sd_multiplier),
+    alpha_prior_sd = as.numeric(alpha_prior_sd)
+  )
 
   if (!is.null(output_file)) {
     output_file <- normalizePath(output_file, winslash = "/", mustWork = FALSE)

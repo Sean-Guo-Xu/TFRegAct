@@ -145,7 +145,7 @@ tf_batch_info <- function(analysis_object, warn_single_level = TRUE) {
     if (isTRUE(warn_single_level)) {
       warning(
         sprintf(
-          "`batch` has fewer than 2 levels (%s); fitting the non-batch Stan model.",
+          "`batch` has fewer than 2 levels (%s); omitting batch columns from `W`.",
           if (length(batch_levels) == 0) "none" else paste(batch_levels, collapse = ", ")
         ),
         call. = FALSE
@@ -161,13 +161,161 @@ tf_batch_info <- function(analysis_object, warn_single_level = TRUE) {
   )
 }
 
+tf_nuisance_prior_scales <- function(prior_scale, column_names) {
+  Q <- length(column_names)
+  if (Q == 0L) {
+    return(numeric(0))
+  }
+
+  prior_scale <- as.numeric(prior_scale)
+  if (any(!is.finite(prior_scale)) || any(prior_scale <= 0)) {
+    tf_model_stop("`nuisance_prior_scale` must contain finite positive values.")
+  }
+  if (length(prior_scale) == 1L) {
+    return(rep(prior_scale, Q))
+  }
+  if (length(prior_scale) != Q) {
+    tf_model_stop(
+      "`nuisance_prior_scale` must have length 1 or match the %d columns of `W`.",
+      Q
+    )
+  }
+  prior_scale
+}
+
+tf_orthonormal_batch_contrasts <- function(level_count) {
+  level_count <- as.integer(level_count[[1]])
+  if (is.na(level_count) || level_count < 1L) {
+    tf_model_stop("`level_count` must be a positive integer.")
+  }
+  if (level_count == 1L) {
+    return(matrix(numeric(0), nrow = 1L, ncol = 0L))
+  }
+
+  contrasts <- stats::contr.helmert(level_count)
+  contrasts <- sweep(
+    contrasts,
+    2L,
+    sqrt(colSums(contrasts ^ 2)),
+    "/"
+  )
+  storage.mode(contrasts) <- "double"
+  contrasts
+}
+
+tf_prepare_nuisance_design <- function(
+  analysis_object,
+  control_level = NULL,
+  disease_level = NULL,
+  nuisance_prior_scale = 1
+) {
+  n_cells <- ncol(analysis_object$expr)
+  condition <- tf_condition_from_sample(
+    analysis_object = analysis_object,
+    control_level = control_level,
+    disease_level = disease_level
+  )
+  if (!is.null(analysis_object$sample) && is.null(condition)) {
+    tf_model_stop(
+      paste(
+        "A supplied condition must contain exactly two non-missing levels.",
+        "Set `condition_column = NULL` to omit condition from the nuisance design."
+      )
+    )
+  }
+  has_condition <- !is.null(condition)
+  batch_info <- tf_batch_info(analysis_object, warn_single_level = FALSE)
+
+  design_parts <- list()
+  if (has_condition) {
+    condition_column <- matrix(as.numeric(condition) - 0.5, ncol = 1L)
+    colnames(condition_column) <- "condition"
+    design_parts[[length(design_parts) + 1L]] <- condition_column
+  }
+
+  if (isTRUE(batch_info$use_batch)) {
+    batch_contrasts <- tf_orthonormal_batch_contrasts(
+      length(batch_info$levels)
+    )
+    batch_matrix <- batch_contrasts[batch_info$index, , drop = FALSE]
+    colnames(batch_matrix) <- paste0(
+      "batch_contrast_",
+      seq_len(ncol(batch_matrix))
+    )
+    design_parts[[length(design_parts) + 1L]] <- batch_matrix
+  }
+
+  W <- if (length(design_parts) == 0L) {
+    matrix(numeric(0), nrow = n_cells, ncol = 0L)
+  } else {
+    do.call(cbind, design_parts)
+  }
+  storage.mode(W) <- "double"
+
+  if (ncol(W) > 0L) {
+    design_with_intercept <- cbind(`(Intercept)` = 1, W)
+    qr_design <- qr(design_with_intercept)
+    if (qr_design$rank < ncol(design_with_intercept)) {
+      tf_model_stop(
+        paste(
+          "The nuisance design is rank deficient.",
+          "Condition may be completely confounded with batch, or a supplied covariate may be redundant."
+        )
+      )
+    }
+  }
+
+  W_names <- colnames(W)
+  W_prior_scale <- tf_nuisance_prior_scales(
+    prior_scale = nuisance_prior_scale,
+    column_names = W_names
+  )
+  condition_w_index <- if (has_condition) match("condition", W_names) else 0L
+  K_batch <- if (isTRUE(batch_info$use_batch)) length(batch_info$levels) else 0L
+  batch_index <- if (isTRUE(batch_info$use_batch)) {
+    as.integer(batch_info$index)
+  } else {
+    rep.int(0L, n_cells)
+  }
+  batch_level_design <- matrix(0, nrow = K_batch, ncol = ncol(W))
+  if (K_batch > 0L) {
+    batch_columns <- grep("^batch_contrast_", W_names)
+    batch_level_design[, batch_columns] <-
+      tf_orthonormal_batch_contrasts(K_batch)
+  }
+  colnames(batch_level_design) <- W_names
+
+  list(
+    Q = ncol(W),
+    W = W,
+    W_prior_scale = W_prior_scale,
+    W_names = W_names,
+    has_condition = has_condition,
+    condition = if (has_condition) as.integer(condition) else rep.int(0L, n_cells),
+    condition_w_index = as.integer(condition_w_index),
+    control_level = attr(condition, "control_level"),
+    disease_level = attr(condition, "disease_level"),
+    use_batch = isTRUE(batch_info$use_batch),
+    batch_levels = if (K_batch > 0L) batch_info$levels else character(0),
+    K_batch = as.integer(K_batch),
+    batch = batch_index,
+    batch_level_design = batch_level_design
+  )
+}
+
 tf_prepare_stan_data <- function(
   analysis_object,
   gamma,
   eta,
   r_dir,
   confidence_min,
-  confidence_max
+  confidence_max,
+  control_level = NULL,
+  disease_level = NULL,
+  nuisance_prior_scale = 1,
+  alpha_prior_sd = 1,
+  target_interaction = FALSE,
+  target_interaction_sd = 0.5
 ) {
   tf_model_validate_object(analysis_object)
 
@@ -181,7 +329,12 @@ tf_prepare_stan_data <- function(
     tf_model_stop("`Y_exp` must be non-negative integers.")
   }
 
-  batch_info <- tf_batch_info(analysis_object)
+  nuisance <- tf_prepare_nuisance_design(
+    analysis_object = analysis_object,
+    control_level = control_level,
+    disease_level = disease_level,
+    nuisance_prior_scale = nuisance_prior_scale
+  )
   direction_index <- tf_direction_to_int(analysis_object$direction)
   confidence <- tf_prepare_confidence(
     confidence = analysis_object$confidence,
@@ -189,49 +342,83 @@ tf_prepare_stan_data <- function(
     max_value = confidence_max
   )
   log_offset <- tf_offset_from_libsize(analysis_object$libsize)
+  target_tf <- trimws(as.character(analysis_object$target[[1]]))
+  target_tf_index <- match(toupper(target_tf), toupper(rownames(expr)))
+  if (is.na(target_tf_index)) {
+    tf_model_stop("Target TF `%s` was not found in `analysis_object$expr`.", target_tf)
+  }
+  if (!is.numeric(alpha_prior_sd) || length(alpha_prior_sd) != 1L ||
+      !is.finite(alpha_prior_sd) || alpha_prior_sd <= 0) {
+    tf_model_stop("`alpha_prior_sd` must be one finite positive number.")
+  }
+  if (!is.logical(target_interaction) || length(target_interaction) != 1L ||
+      is.na(target_interaction)) {
+    tf_model_stop("`target_interaction` must be TRUE or FALSE.")
+  }
+  if (!is.numeric(target_interaction_sd) ||
+      length(target_interaction_sd) != 1L ||
+      !is.finite(target_interaction_sd) || target_interaction_sd <= 0) {
+    tf_model_stop("`target_interaction_sd` must be one finite positive number.")
+  }
+  if (isTRUE(target_interaction) && !isTRUE(nuisance$has_condition)) {
+    tf_model_stop("Target interaction requires a valid two-level condition.")
+  }
+  use_target_interaction <- isTRUE(target_interaction) &&
+    isTRUE(nuisance$has_condition)
 
   stan_data <- list(
     N = ncol(expr),
     P = nrow(expr),
     Y = y_vec,
     X = t(expr),
+    Q = as.integer(nuisance$Q),
+    W = nuisance$W,
+    W_prior_scale = as.vector(nuisance$W_prior_scale),
+    has_condition = as.integer(nuisance$has_condition),
+    condition = as.array(nuisance$condition),
+    condition_w_index = nuisance$condition_w_index,
+    K_batch = nuisance$K_batch,
+    batch = as.array(nuisance$batch),
+    batch_level_design = nuisance$batch_level_design,
     log_offset = as.vector(log_offset),
     confidence = as.vector(confidence),
     direction = as.array(direction_index),
     gamma = as.numeric(gamma),
     eta = as.numeric(eta),
-    r_dir = as.numeric(r_dir)
+    r_dir = as.numeric(r_dir),
+    alpha_prior_sd = as.numeric(alpha_prior_sd),
+    target_tf_index = as.integer(target_tf_index),
+    use_target_interaction = as.integer(use_target_interaction),
+    target_condition_centered = if (use_target_interaction) {
+      as.numeric(nuisance$condition) - 0.5
+    } else {
+      rep(0, ncol(expr))
+    },
+    target_interaction_sd = as.numeric(target_interaction_sd)
   )
-  if (isTRUE(batch_info$use_batch)) {
-    stan_data$batch <- batch_info$index
-    stan_data$K_batch <- length(batch_info$levels)
-  }
 
   attr(stan_data, "feature_names") <- rownames(expr)
   attr(stan_data, "cell_names") <- colnames(expr)
   attr(stan_data, "target") <- analysis_object$target
   attr(stan_data, "confidence_used") <- confidence
-  attr(stan_data, "batch_levels") <- batch_info$levels
-  attr(stan_data, "use_batch_model") <- isTRUE(batch_info$use_batch)
+  attr(stan_data, "W_names") <- nuisance$W_names
+  attr(stan_data, "batch_levels") <- nuisance$batch_levels
+  attr(stan_data, "use_batch_model") <- nuisance$use_batch
+  attr(stan_data, "condition_model") <- nuisance$has_condition
+  attr(stan_data, "control_level") <- nuisance$control_level
+  attr(stan_data, "disease_level") <- nuisance$disease_level
+  attr(stan_data, "target_tf_index") <- target_tf_index
+  attr(stan_data, "target_interaction_model") <- use_target_interaction
   stan_data
 }
 
-tf_default_stan_file <- function(use_batch_model = TRUE) {
-  stan_file <- if (isTRUE(use_batch_model)) {
-    "TF_directional_nb_model.stan"
-  } else {
-    "TF_directional_nb_model_nobatch.stan"
-  }
-  .tfregact_stan_file(stan_file)
+tf_default_stan_file <- function(use_batch_model = NULL) {
+  .tfregact_stan_file("TF_directional_nb_model.stan")
 }
 
-tf_select_stage1_stan_file <- function(stan_file, use_batch_model) {
+tf_select_stage1_stan_file <- function(stan_file, use_batch_model = NULL) {
   if (is.null(stan_file) || !nzchar(stan_file)) {
-    return(tf_default_stan_file(use_batch_model = use_batch_model))
-  }
-
-  if (!isTRUE(use_batch_model) && basename(stan_file) == "TF_directional_nb_model.stan") {
-    return(tf_default_stan_file(use_batch_model = FALSE))
+    return(tf_default_stan_file())
   }
 
   .tfregact_stan_file(stan_file)
@@ -252,6 +439,10 @@ run_TF_directional_model <- function(
   seed,
   refresh,
   force_recompile,
+  control_level = NULL,
+  disease_level = NULL,
+  nuisance_prior_scale = 1,
+  alpha_prior_sd = 1,
   ...
 ) {
   tf_model_require_pkg("cmdstanr")
@@ -262,7 +453,12 @@ run_TF_directional_model <- function(
     eta = eta,
     r_dir = r_dir,
     confidence_min = confidence_min,
-    confidence_max = confidence_max
+    confidence_max = confidence_max,
+    control_level = control_level,
+    disease_level = disease_level,
+    nuisance_prior_scale = nuisance_prior_scale,
+    alpha_prior_sd = alpha_prior_sd,
+    target_interaction = FALSE
   )
   use_batch_model <- isTRUE(attr(stan_data, "use_batch_model"))
   stan_file <- tf_select_stage1_stan_file(stan_file, use_batch_model)
@@ -272,8 +468,10 @@ run_TF_directional_model <- function(
     force_recompile = force_recompile,
     include_log_lik = FALSE
   )
-  fit <- model$sample(
-    data = stan_data,
+  fit <- tf_fit_shared_laplace_stage1(
+    stan_data = stan_data,
+    inference = "mcmc",
+    model = model,
     chains = chains,
     parallel_chains = parallel_chains,
     iter_warmup = iter_warmup,
@@ -290,7 +488,11 @@ run_TF_directional_model <- function(
     target = attr(stan_data, "target"),
     feature_names = attr(stan_data, "feature_names"),
     cell_names = attr(stan_data, "cell_names"),
-    use_batch_model = use_batch_model
+    use_batch_model = use_batch_model,
+    condition_model = isTRUE(attr(stan_data, "condition_model")),
+    control_level = attr(stan_data, "control_level"),
+    disease_level = attr(stan_data, "disease_level"),
+    W_names = attr(stan_data, "W_names")
   )
 }
 
@@ -673,42 +875,17 @@ filter_TF_analysis_object_by_beta_ci <- function(
   filtered_object
 }
 
-tf_default_stage2_stan_file <- function(condition_model = FALSE, use_batch_model = TRUE) {
-  stan_file <- if (isTRUE(condition_model) && isTRUE(use_batch_model)) {
-    "TF_stage2_condition_directional_nb_model.stan"
-  } else if (isTRUE(condition_model)) {
-    "TF_stage2_condition_directional_nb_model_nobatch.stan"
-  } else if (isTRUE(use_batch_model)) {
-    "TF_stage2_directional_nb_model.stan"
-  } else {
-    "TF_stage2_directional_nb_model_nobatch.stan"
-  }
-  .tfregact_stan_file(stan_file)
+tf_default_stage2_stan_file <- function(condition_model = NULL, use_batch_model = NULL) {
+  .tfregact_stan_file("TF_stage2_directional_nb_model.stan")
 }
 
-tf_select_stage2_stan_file <- function(stan_file, condition_model, use_batch_model) {
+tf_select_stage2_stan_file <- function(
+  stan_file,
+  condition_model = NULL,
+  use_batch_model = NULL
+) {
   if (is.null(stan_file) || !nzchar(stan_file)) {
-    return(tf_default_stage2_stan_file(
-      condition_model = condition_model,
-      use_batch_model = use_batch_model
-    ))
-  }
-
-  if (!isTRUE(use_batch_model)) {
-    if (isTRUE(condition_model) &&
-        basename(stan_file) == "TF_stage2_condition_directional_nb_model.stan") {
-      return(tf_default_stage2_stan_file(
-        condition_model = TRUE,
-        use_batch_model = FALSE
-      ))
-    }
-    if (!isTRUE(condition_model) &&
-        basename(stan_file) == "TF_stage2_directional_nb_model.stan") {
-      return(tf_default_stage2_stan_file(
-        condition_model = FALSE,
-        use_batch_model = FALSE
-      ))
-    }
+    return(tf_default_stage2_stan_file())
   }
 
   .tfregact_stan_file(stan_file)
@@ -896,9 +1073,23 @@ tf_prepare_stage2_stan_data <- function(
   control_level,
   disease_level,
   confidence_min,
-  confidence_max
+  confidence_max,
+  nuisance_prior_scale = 1,
+  target_interaction = FALSE,
+  target_interaction_sd = 0.5
 ) {
   tf_model_validate_object(analysis_object)
+
+  if (!is.logical(target_interaction) || length(target_interaction) != 1L ||
+      is.na(target_interaction)) {
+    tf_model_stop("`target_interaction` must be TRUE or FALSE.")
+  }
+  if (!is.numeric(target_interaction_sd) ||
+      length(target_interaction_sd) != 1L ||
+      !is.finite(target_interaction_sd) ||
+      target_interaction_sd <= 0) {
+    tf_model_stop("`target_interaction_sd` must be one finite positive number.")
+  }
 
   base_data <- tf_prepare_stan_data(
     analysis_object = analysis_object,
@@ -908,64 +1099,85 @@ tf_prepare_stage2_stan_data <- function(
     eta = 0.5,
     r_dir = 3,
     confidence_min = confidence_min,
-    confidence_max = confidence_max
+    confidence_max = confidence_max,
+    control_level = control_level,
+    disease_level = disease_level,
+    nuisance_prior_scale = nuisance_prior_scale
   )
   beta_summary <- tf_stage2_beta_summary(
     analysis_object = analysis_object,
     stage1_fit_result = stage1_fit_result
   )
-  condition <- tf_condition_from_sample(
-    analysis_object = analysis_object,
-    control_level = control_level,
-    disease_level = disease_level
-  )
-  use_condition_model <- !is.null(condition)
+  use_condition_model <- isTRUE(attr(base_data, "condition_model"))
+  if (isTRUE(target_interaction) && !use_condition_model) {
+    tf_model_stop(
+      "The target-interaction Stage 2 model requires a valid two-level condition in `analysis_object$sample`."
+    )
+  }
 
   stan_data_names <- c(
     "N",
     "P",
     "Y",
     "X",
+    "Q",
+    "W",
+    "W_prior_scale",
+    "has_condition",
+    "condition",
+    "condition_w_index",
+    "K_batch",
+    "batch",
+    "batch_level_design",
     "log_offset",
-    "confidence",
-    "direction"
+    "alpha_prior_sd"
   )
-  if (isTRUE(attr(base_data, "use_batch_model"))) {
-    stan_data_names <- append(stan_data_names, c("batch", "K_batch"), after = 4)
-  }
   stan_data <- base_data[stan_data_names]
 
-  stan_data$stage1_beta_mean <- beta_summary$stage1_beta_mean
-  stan_data$stage1_beta_sd <- pmax(beta_summary$stage1_beta_sd, 0)
-  stan_data$direction_effect <- as.numeric(direction_effect)
-  stan_data$beta_sd_floor <- as.numeric(beta_sd_floor)
-  stan_data$stage1_sd_multiplier <- as.numeric(stage1_sd_multiplier)
+  stage2_prior <- tf_stage2_prior_from_stage1(
+    stage1_beta_mean = beta_summary$stage1_beta_mean,
+    stage1_beta_sd = beta_summary$stage1_beta_sd,
+    direction = base_data$direction,
+    direction_effect = direction_effect,
+    beta_sd_floor = beta_sd_floor,
+    stage1_sd_multiplier = stage1_sd_multiplier
+  )
+  stan_data$beta_prior_mean <- stage2_prior$beta_prior_mean
+  stan_data$beta_prior_sd <- stage2_prior$beta_prior_sd
+  stan_data$beta_init <- stage2_prior$stage1_beta_mean
 
-  if (isTRUE(use_condition_model)) {
-    target_tf <- as.character(attr(base_data, "target")[[1]])
-    target_tf_index <- match(target_tf, attr(base_data, "feature_names"))
-    if (is.na(target_tf_index)) {
-      tf_model_stop(
-        "Target TF `%s` was not found in `analysis_object$expr`; condition-stage2 models require it to calculate target TF regulatory contribution.",
-        target_tf
-      )
-    }
-    stan_data$condition <- as.array(condition)
-    stan_data$target_tf_index <- as.integer(target_tf_index)
-    attr(stan_data, "target_tf") <- target_tf
-    attr(stan_data, "target_tf_index") <- target_tf_index
+  target_tf <- as.character(attr(base_data, "target")[[1]])
+  target_tf_index <- match(target_tf, attr(base_data, "feature_names"))
+  if (is.na(target_tf_index)) {
+    tf_model_stop(
+      "Target TF `%s` was not found in `analysis_object$expr`.",
+      target_tf
+    )
   }
+  stan_data$target_tf_index <- as.integer(target_tf_index)
+  stan_data$use_target_interaction <- as.integer(target_interaction)
+  stan_data$target_condition_centered <- if (isTRUE(target_interaction)) {
+    as.numeric(stan_data$condition) - 0.5
+  } else {
+    rep(0, stan_data$N)
+  }
+  stan_data$target_interaction_sd <- as.numeric(target_interaction_sd)
 
   attr(stan_data, "feature_names") <- attr(base_data, "feature_names")
   attr(stan_data, "cell_names") <- attr(base_data, "cell_names")
   attr(stan_data, "target") <- attr(base_data, "target")
   attr(stan_data, "confidence_used") <- attr(base_data, "confidence_used")
+  attr(stan_data, "W_names") <- attr(base_data, "W_names")
   attr(stan_data, "batch_levels") <- attr(base_data, "batch_levels")
   attr(stan_data, "use_batch_model") <- attr(base_data, "use_batch_model")
   attr(stan_data, "condition_model") <- use_condition_model
-  attr(stan_data, "control_level") <- attr(condition, "control_level")
-  attr(stan_data, "disease_level") <- attr(condition, "disease_level")
+  attr(stan_data, "control_level") <- attr(base_data, "control_level")
+  attr(stan_data, "disease_level") <- attr(base_data, "disease_level")
+  attr(stan_data, "target_tf") <- target_tf
+  attr(stan_data, "target_tf_index") <- target_tf_index
+  attr(stan_data, "target_interaction_model") <- isTRUE(target_interaction)
   attr(stan_data, "stage1_beta_summary") <- beta_summary
+  attr(stan_data, "stage2_prior") <- stage2_prior
 
   stan_data
 }
@@ -989,6 +1201,9 @@ run_TF_stage2_directional_model <- function(
   refresh,
   compute_loo,
   force_recompile,
+  nuisance_prior_scale = 1,
+  target_interaction = FALSE,
+  target_interaction_sd = 0.5,
   ...
 ) {
   tf_model_require_pkg("cmdstanr")
@@ -1002,7 +1217,10 @@ run_TF_stage2_directional_model <- function(
     control_level = control_level,
     disease_level = disease_level,
     confidence_min = confidence_min,
-    confidence_max = confidence_max
+    confidence_max = confidence_max,
+    nuisance_prior_scale = nuisance_prior_scale,
+    target_interaction = target_interaction,
+    target_interaction_sd = target_interaction_sd
   )
 
   condition_model <- isTRUE(attr(stan_data, "condition_model"))
@@ -1014,8 +1232,9 @@ run_TF_stage2_directional_model <- function(
     force_recompile = force_recompile,
     include_log_lik = isTRUE(compute_loo)
   )
-  fit <- model$sample(
-    data = stan_data,
+  fit <- tf_fit_shared_stage2(
+    stan_data = stan_data,
+    model = model,
     chains = chains,
     parallel_chains = parallel_chains,
     iter_warmup = iter_warmup,
@@ -1036,8 +1255,13 @@ run_TF_stage2_directional_model <- function(
     cell_names = attr(stan_data, "cell_names"),
     use_batch_model = use_batch_model,
     condition_model = condition_model,
+    target_interaction_model = isTRUE(attr(stan_data, "target_interaction_model")),
+    target_tf = attr(stan_data, "target_tf"),
+    target_tf_index = attr(stan_data, "target_tf_index"),
     control_level = attr(stan_data, "control_level"),
     disease_level = attr(stan_data, "disease_level"),
-    stage1_beta_summary = attr(stan_data, "stage1_beta_summary")
+    W_names = attr(stan_data, "W_names"),
+    stage1_beta_summary = attr(stan_data, "stage1_beta_summary"),
+    stage2_prior = attr(stan_data, "stage2_prior")
   )
 }

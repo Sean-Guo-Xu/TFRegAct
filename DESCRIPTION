@@ -2,6 +2,8 @@ Package: TFRegAct
 Type: Package
 Title: Bayesian Transcription Factor Regulation and Activity Inference
 Version: 0.0.0.9000
+Depends:
+    R (>= 4.1.0)
 Authors@R: 
     person(given = "TBD", family = "TBD", role = c("aut", "cre"),
            email = "tbd@example.org")
@@ -16,12 +18,15 @@ Imports:
     cmdstanr,
     data.table,
     igraph,
+    Matrix,
     methods,
-    posterior,
     Rcpp,
-    Seurat,
+    SeuratObject,
     stats,
     tools,
     utils
+Suggests:
+    loo,
+    pheatmap
 LinkingTo:
     Rcpp

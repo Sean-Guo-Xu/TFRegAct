@@ -1,57 +1,83 @@
 data {
-  int<lower=1> N;                         // number of cells
-  int<lower=1> P;                         // number of TFs
-  array[N] int<lower=0> Y;                // target gene counts
+  int<lower=1> N;
+  int<lower=1> P;
+  array[N] int<lower=0> Y;
+  matrix[N, P] X;
 
-  matrix[N, P] X;                         // TF expression matrix
-  array[N] int<lower=1> batch;            // batch index
-  int<lower=1> K_batch;                   // number of batches
+  int<lower=0> Q;
+  matrix[N, Q] W;
+  vector<lower=0>[Q] W_prior_scale;
+  int<lower=0, upper=1> has_condition;
+  array[N] int<lower=0, upper=1> condition;
+  int<lower=0, upper=Q> condition_w_index;
 
-  vector[N] log_offset;                   // log library size divided by mean library size
+  int<lower=0> K_batch;
+  array[N] int<lower=0, upper=K_batch> batch;
+  matrix[K_batch, Q] batch_level_design;
 
-  vector<lower=0>[P] confidence;           // raw confidence score
+  vector[N] log_offset;
+  vector<lower=0>[P] confidence;
   array[P] int<lower=-1, upper=1> direction;
+  real<lower=0> gamma;
+  real<lower=0> eta;
+  real<lower=1> r_dir;
+  real<lower=0> alpha_prior_sd;
 
-  real<lower=0> gamma;                    // global shrinkage scale
-  real<lower=0> eta;                      // confidence exponent
-  real<lower=1> r_dir;                    // opposite-direction penalty multiplier
+  int<lower=1, upper=P> target_tf_index;
+  int<lower=0, upper=1> use_target_interaction;
+  vector[N] target_condition_centered;
+  real<lower=0> target_interaction_sd;
 }
 
 parameters {
   real alpha;
-
   vector[P] beta;
-
-  vector[K_batch] batch_raw;
-  real<lower=0> sigma_batch;
-
-  real<lower=0> phi;                      // NB overdispersion
+  vector[Q] zeta;
+  vector[use_target_interaction] beta_target_delta_free;
+  real log_phi;
 }
 
 transformed parameters {
-  vector[K_batch] batch_effect;
   vector[N] log_mu;
+  vector[K_batch] batch_effect;
+  real condition_effect;
+  real<lower=0> phi;
+  real beta_target_mean;
+  real beta_target_delta;
+  real beta_target_control;
+  real beta_target_disease;
 
-  // Sum-to-zero batch effects for identifiability
-  batch_effect = sigma_batch * (batch_raw - mean(batch_raw));
-
-  for (i in 1:N) {
-    log_mu[i] =
-      alpha
-      + X[i] * beta
-      + batch_effect[batch[i]]
-      + log_offset[i];
+  condition_effect = 0;
+  if (has_condition == 1) {
+    condition_effect = zeta[condition_w_index];
   }
+  batch_effect = batch_level_design * zeta;
+  phi = exp(log_phi);
+
+  beta_target_mean = beta[target_tf_index];
+  beta_target_delta = 0;
+  if (use_target_interaction == 1) {
+    beta_target_delta = beta_target_delta_free[1];
+  }
+  beta_target_control = beta_target_mean - 0.5 * beta_target_delta;
+  beta_target_disease = beta_target_mean + 0.5 * beta_target_delta;
+
+  log_mu = alpha + X * beta + W * zeta + log_offset;
+  log_mu += target_condition_centered
+    .* col(X, target_tf_index) * beta_target_delta;
 }
 
 model {
-  // Hyperpriors / nuisance priors
-  alpha ~ normal(0, 1);
-  batch_raw ~ normal(0, 1);
-  sigma_batch ~ normal(0, 1);
-  phi ~ lognormal(0, 1);
+  alpha ~ normal(0, alpha_prior_sd);
+  log_phi ~ normal(0, 1);
+  if (Q > 0) {
+    zeta ~ normal(rep_vector(0, Q), W_prior_scale);
+  }
+  if (use_target_interaction == 1) {
+    beta_target_delta_free[1] ~ normal(0, target_interaction_sd);
+  }
 
-  // Confidence-weighted directional asymmetric Laplace prior for beta
+  // Zero-mode, confidence-weighted directional asymmetric Laplace prior.
   for (j in 1:P) {
     real b_j;
     real lambda_fav;
@@ -60,45 +86,30 @@ model {
     real lambda_neg;
 
     b_j = pow(fmax(confidence[j], 1.0) / 10.0, eta) * gamma;
-
     lambda_fav = 1.0 / b_j;
-
-    if (direction[j] == 0) {
-      lambda_opp = lambda_fav;
-    } else {
-      lambda_opp = r_dir * lambda_fav;
-    }
+    lambda_opp = direction[j] == 0 ? lambda_fav : r_dir * lambda_fav;
 
     if (direction[j] == 1) {
-      // activation prior: positive beta is favored
       lambda_pos = lambda_fav;
       lambda_neg = lambda_opp;
     } else if (direction[j] == -1) {
-      // repression prior: negative beta is favored
       lambda_pos = lambda_opp;
       lambda_neg = lambda_fav;
     } else {
-      // unknown direction: symmetric Laplace
       lambda_pos = lambda_fav;
       lambda_neg = lambda_fav;
     }
 
-    // Two-sided asymmetric Laplace prior centered at zero:
-    // p(beta) = lambda_pos * lambda_neg / (lambda_pos + lambda_neg)
-    //           * exp(-lambda_pos * beta) for beta >= 0
-    //           * exp( lambda_neg * beta) for beta < 0
     target += log(lambda_pos)
               + log(lambda_neg)
               - log(lambda_pos + lambda_neg);
-
     if (beta[j] >= 0) {
       target += -lambda_pos * beta[j];
     } else {
-      target +=  lambda_neg * beta[j];
+      target += lambda_neg * beta[j];
     }
   }
 
-  // Negative-binomial likelihood
   Y ~ neg_binomial_2_log(log_mu, phi);
 }
 

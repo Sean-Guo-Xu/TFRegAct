@@ -3,3 +3,4 @@
 ^\.codex$
 ^\.agents$
 ^tests$
+^inst/stan/.*\.(exe|hpp)$

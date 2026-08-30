@@ -1,0 +1,2 @@
+inst/stan/*.exe
+inst/stan/*.hpp
