@@ -46,7 +46,8 @@
 #' present, both are encoded in one nuisance design matrix shared by Stage 1
 #' and Stage 2.
 #' The workflow searches a target-specific adjustment set, fits a sparse Stage 1
-#' model, removes unsupported non-target TFs, then fits Stage 2 MCMC. `output`
+#' model by MCMC (default) or variational inference, removes unsupported
+#' non-target TFs, then fits Stage 2 exclusively by MCMC. `output`
 #' follows TF_activity_computation(): FALSE returns results only in memory, TRUE
 #' creates `<TF>_<GENE>_regulatory_output`, and a character value is a custom path.
 TF_regulatory_direction_computation <- function(
@@ -79,11 +80,15 @@ TF_regulatory_direction_computation <- function(
   nuisance_prior_scale = 1,
   confidence_min = 1,
   confidence_max = 10,
+  stage1_inference = c("mcmc", "variational"),
   stage1_chains = 3L,
   stage1_iter_warmup = 600L,
   stage1_iter_sampling = 1200L,
   stage1_adapt_delta = 0.95,
   stage1_max_treedepth = 12L,
+  stage1_variational_algorithm = c("meanfield", "fullrank"),
+  stage1_variational_iter = 10000L,
+  stage1_variational_output_samples = 2000L,
   stage1_filter_interval = c(5, 95),
   correlation_filter = TRUE,
   correlation_threshold = 0.7,
@@ -103,6 +108,8 @@ TF_regulatory_direction_computation <- function(
   force_recompile = FALSE
 ) {
   stage2_model <- match.arg(stage2_model)
+  stage1_inference <- match.arg(stage1_inference)
+  stage1_variational_algorithm <- match.arg(stage1_variational_algorithm)
   if (!is.null(max_adjustment_sets)) {
     warning(
       "`max_adjustment_sets` is obsolete and ignored; use `adjustment_search_starts`.",
@@ -164,14 +171,18 @@ TF_regulatory_direction_computation <- function(
 
   stage1_started <- Sys.time()
   stage1_fit <- run_TF_directional_model(
-    analysis_object = analysis_object, stan_file = NULL, gamma = gamma, eta = eta,
+    analysis_object = analysis_object, stan_file = NULL,
+    inference = stage1_inference, gamma = gamma, eta = eta,
     r_dir = r_dir, confidence_min = confidence_min, confidence_max = confidence_max,
     chains = stage1_chains, parallel_chains = stage1_chains,
     iter_warmup = stage1_iter_warmup, iter_sampling = stage1_iter_sampling,
     seed = seed, refresh = refresh, force_recompile = force_recompile,
     control_level = control_level, disease_level = disease_level,
     nuisance_prior_scale = nuisance_prior_scale,
-    adapt_delta = stage1_adapt_delta, max_treedepth = stage1_max_treedepth
+    adapt_delta = stage1_adapt_delta, max_treedepth = stage1_max_treedepth,
+    variational_algorithm = stage1_variational_algorithm,
+    variational_iter = stage1_variational_iter,
+    variational_output_samples = stage1_variational_output_samples
   )
   stage1_elapsed <- as.numeric(difftime(Sys.time(), stage1_started, units = "secs"))
 
@@ -218,7 +229,8 @@ TF_regulatory_direction_computation <- function(
   if (is.na(target_index)) .tf_regulatory_direction_stop("Target TF `%s` is missing from Stage 2 beta draws.", target_tf)
   target_beta <- as.numeric(beta_draws[, target_index])
   direction_summary <- data.frame(
-    target_tf = target_tf, target_gene = target_gene, stage2_model = stage2_model,
+    target_tf = target_tf, target_gene = target_gene,
+    stage1_inference = stage1_inference, stage2_model = stage2_model,
     posterior_mean = mean(target_beta), posterior_median = stats::median(target_beta),
     q05 = unname(stats::quantile(target_beta, 0.05)),
     q95 = unname(stats::quantile(target_beta, 0.95)),
@@ -237,7 +249,7 @@ TF_regulatory_direction_computation <- function(
   if (persist_output) {
     utils::write.csv(direction_summary, file.path(work_dir, paste0(target_tf, "_", target_gene, "_direction_summary.csv")), row.names = FALSE)
     utils::write.csv(timing, file.path(work_dir, paste0(target_tf, "_", target_gene, "_timing.csv")), row.names = FALSE)
-    saveRDS(list(adjustment = adjustment, analysis_object = analysis_object, filtered_analysis_object = filtered_analysis_object, stage1_fit = stage1_fit, stage2_fit = stage2_fit, direction_summary = direction_summary, timing = timing), file.path(work_dir, paste0(target_tf, "_", target_gene, "_regulatory_result.rds")))
+    saveRDS(list(adjustment = adjustment, analysis_object = analysis_object, filtered_analysis_object = filtered_analysis_object, stage1_fit = stage1_fit, stage1_inference = stage1_inference, stage2_fit = stage2_fit, direction_summary = direction_summary, timing = timing), file.path(work_dir, paste0(target_tf, "_", target_gene, "_regulatory_result.rds")))
   }
 
   invisible(structure(list(
@@ -245,7 +257,8 @@ TF_regulatory_direction_computation <- function(
     output_dir = if (persist_output) normalizePath(work_dir, winslash = "/", mustWork = TRUE) else NULL,
     adjustment = adjustment, analysis_object = analysis_object,
     filtered_analysis_object = filtered_analysis_object, stage1_fit = stage1_fit,
-    stage2_fit = stage2_fit, direction_summary = direction_summary,
+    stage2_fit = stage2_fit, stage1_inference = stage1_inference,
+    direction_summary = direction_summary,
     posterior_plot = posterior_plot, timing = timing
   ), class = c("TFRegulatoryDirectionComputation", "list")))
 }

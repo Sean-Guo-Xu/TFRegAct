@@ -1003,7 +1003,7 @@ tf_em_summarize_draw_results <- function(draw_results, common, settings) {
   )
 }
 
-#' Run spike-and-slab latent-activity EM over Stage 1 nuisance draws.
+#' Run spike-and-slab latent-activity EM over Stage 2 nuisance draws.
 #'
 #' Each cell has an exact inactive state A = 0 and a positive truncated-normal
 #' slab anchored to target-TF normalized expression. The negative-binomial
@@ -1013,12 +1013,15 @@ tf_em_summarize_draw_results <- function(draw_results, common, settings) {
 #' active probability of 0.9. The gate is soft in both groups, so zero TF
 #' expression strongly downweights activity without forcing it to exactly zero.
 #'
-#' With `nuisance_draw_count = 0`, eta0 and phi use their Stage 1 posterior
+#' With `nuisance_draw_count = 0`, eta0 and phi use their Stage 2 posterior
 #' means and one EM fit is run. A positive count selects that many evenly spaced
 #' posterior draws and fits them independently; their activity posteriors form
 #' an equal-weight mixture. Explicit draw IDs remain available as an override.
-#' Stage 1 target beta draws are not reused as priors: Stage 1 means initialize
-#' EM, while the original confidence/direction priors are used in every M-step.
+#' Stage 2 target-beta posterior means initialize EM but are not reused as
+#' priors. Every M-step instead uses the posterior-informed Normal prior that
+#' was supplied to Stage 2. Confounder effects are fixed within each nuisance
+#' draw, so their Stage 2 posterior uncertainty is propagated only when more
+#' than one nuisance draw is requested.
 run_TF_EM_latent_activity <- function(
   stage2_input,
   nuisance_draw_count = 0L,

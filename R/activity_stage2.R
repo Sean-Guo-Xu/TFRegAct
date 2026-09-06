@@ -4,13 +4,14 @@ tf_em_stage2_input_stop <- function(...) {
   stop(sprintf(...), call. = FALSE)
 }
 
-#' Convert retained Stage 1 models into the compact EM Stage 2 interface.
+#' Convert retained Stage 2 MCMC models into the compact Stage 3 EM interface.
 #'
-#' Stage 1 target-TF coefficients are supplied only as EM initial values. For
+#' Stage 2 target-TF posterior means are supplied only as EM initial values. For
 #' each retained joint posterior draw, eta0 contains the intercept, condition,
 #' batch, offset, and every confounder contribution, but deliberately excludes
-#' the target-TF main effect and target-TF-by-condition interaction. Those two
-#' effects will be represented by latent activity A in Stage 2.
+#' the target-TF main effect and target-TF-by-condition interaction. The EM
+#' M-step uses the posterior-informed Normal prior originally supplied to Stage
+#' 2, while the target-TF expression is replaced by latent activity A.
 build_TF_EM_stage2_input <- function(
   stage1_filtered_results,
   stage1_screening_input,

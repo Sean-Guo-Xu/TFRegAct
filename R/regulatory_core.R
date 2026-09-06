@@ -427,6 +427,7 @@ tf_select_stage1_stan_file <- function(stan_file, use_batch_model = NULL) {
 run_TF_directional_model <- function(
   analysis_object,
   stan_file,
+  inference = c("mcmc", "variational"),
   gamma,
   eta,
   r_dir,
@@ -443,9 +444,14 @@ run_TF_directional_model <- function(
   disease_level = NULL,
   nuisance_prior_scale = 1,
   alpha_prior_sd = 1,
+  variational_algorithm = c("meanfield", "fullrank"),
+  variational_iter = 10000L,
+  variational_output_samples = 2000L,
   ...
 ) {
   tf_model_require_pkg("cmdstanr")
+  inference <- match.arg(inference)
+  variational_algorithm <- match.arg(variational_algorithm)
 
   stan_data <- tf_prepare_stan_data(
     analysis_object = analysis_object,
@@ -470,7 +476,7 @@ run_TF_directional_model <- function(
   )
   fit <- tf_fit_shared_laplace_stage1(
     stan_data = stan_data,
-    inference = "mcmc",
+    inference = inference,
     model = model,
     chains = chains,
     parallel_chains = parallel_chains,
@@ -478,6 +484,9 @@ run_TF_directional_model <- function(
     iter_sampling = iter_sampling,
     seed = seed,
     refresh = refresh,
+    variational_algorithm = variational_algorithm,
+    variational_iter = variational_iter,
+    variational_output_samples = variational_output_samples,
     ...
   )
 
@@ -492,7 +501,9 @@ run_TF_directional_model <- function(
     condition_model = isTRUE(attr(stan_data, "condition_model")),
     control_level = attr(stan_data, "control_level"),
     disease_level = attr(stan_data, "disease_level"),
-    W_names = attr(stan_data, "W_names")
+    W_names = attr(stan_data, "W_names"),
+    inference = inference,
+    variational_algorithm = if (identical(inference, "variational")) variational_algorithm else NULL
   )
 }
 
