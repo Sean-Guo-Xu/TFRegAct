@@ -70,7 +70,7 @@ TF_regulatory_direction_computation <- function(
   libsize = NULL,
   network_edge_file = .tfregact_default_network_file(),
   confounder_confidence_threshold = 3,
-  adjustment_search_starts = 8L,
+  adjustment_search_starts = 1L,
   adjustment_search_cores = 4L,
   max_adjustment_sets = NULL,
   dagitty_beta = 2,
@@ -105,14 +105,21 @@ TF_regulatory_direction_computation <- function(
   compute_loo = FALSE,
   seed = 123L,
   refresh = 50L,
-  force_recompile = FALSE
+  force_recompile = FALSE,
+  data_type = c("single_cell", "bulk"),
+  sample_column = NULL,
+  sample_intercept_sd_scale = 1,
+  sample_slope_sd_scale = 1
 ) {
+  data_type_supplied <- !missing(data_type)
+  sample_column_supplied <- !missing(sample_column)
+  data_type <- match.arg(data_type)
   stage2_model <- match.arg(stage2_model)
   stage1_inference <- match.arg(stage1_inference)
   stage1_variational_algorithm <- match.arg(stage1_variational_algorithm)
   if (!is.null(max_adjustment_sets)) {
     warning(
-      "`max_adjustment_sets` is obsolete and ignored; use `adjustment_search_starts`.",
+      "`max_adjustment_sets` is obsolete and ignored; minimum-cut search returns one minimum-cardinality set.",
       call. = FALSE
     )
   }
@@ -120,6 +127,10 @@ TF_regulatory_direction_computation <- function(
   if (!is.null(input)) {
     if (!is.null(seurat_obj) || !is.null(data_file)) .tf_regulatory_direction_stop("When `input` is supplied, do not also supply `seurat_obj` or `data_file`.")
     input_values <- tf_computation_input_values(input)
+    if (data_type_supplied && !identical(data_type, input_values$data_type)) .tf_regulatory_direction_stop("`data_type` disagrees with the input object.")
+    if (sample_column_supplied && !identical(sample_column, input_values$sample_column)) .tf_regulatory_direction_stop("`sample_column` disagrees with the input object.")
+    data_type <- input_values$data_type
+    sample_column <- input_values$sample_column
     seurat_obj <- input_values$seurat_obj
     if (!is.null(target_tf) && !identical(toupper(trimws(as.character(target_tf[[1]]))), toupper(input_values$target_tf))) .tf_regulatory_direction_stop("`target_tf` disagrees with `input@target_tf`.")
     if (!is.null(target_gene) && !is.na(input_values$target_gene) && !identical(toupper(trimws(as.character(target_gene[[1]]))), toupper(input_values$target_gene))) .tf_regulatory_direction_stop("`target_gene` disagrees with `input@target_gene`.")
@@ -149,6 +160,22 @@ TF_regulatory_direction_computation <- function(
     pbmc <- subset(pbmc, cells = colnames(pbmc)[pbmc[[batch_column]][, 1] %in% batch_subset])
   }
   if (!ncol(pbmc)) .tf_regulatory_direction_stop("No cells remain after subsetting.")
+  stage2_requested_model <- stage2_model
+  stage2_model <- tf_regulatory_stage2_route(data_type, condition_column, stage2_model)
+  message("Stage 2 route: ", stage2_model, " (", data_type,
+    if (is.null(condition_column)) ", no condition)." else ", with condition).")
+  if (!is.null(condition_column)) {
+    if (!(condition_column %in% names(pbmc[[]])) ||
+        anyNA(pbmc[[]][[condition_column]]) ||
+        length(unique(as.character(pbmc[[]][[condition_column]]))) != 2L) {
+      .tf_regulatory_direction_stop("`condition_column` must contain exactly two nonmissing levels after subsetting; use NULL to omit condition.")
+    }
+  }
+  if (identical(stage2_model, "hierarchical") &&
+      (is.null(sample_column) || sample_column %in% c(condition_column, batch_column) ||
+       !(sample_column %in% names(pbmc[[]])))) {
+    .tf_regulatory_direction_stop("Supply a biological `sample_column` distinct from condition and batch for conditioned single-cell data.")
+  }
 
   adjustment_started <- Sys.time()
   adjustment <- find_adjustment_dagitty(
@@ -168,6 +195,16 @@ TF_regulatory_direction_computation <- function(
     layer = layer, libsize = libsize, confidence_col = "overall_avg_confidence",
     direction_col = "effect_on_gene_A"
   )
+  analysis_object$data_type <- data_type
+  analysis_object$sample_column <- sample_column
+  analysis_object$biological_sample <- if (is.null(sample_column)) NULL else
+    setNames(as.character(pbmc[[]][colnames(analysis_object$expr), sample_column]), colnames(analysis_object$expr))
+  if (identical(stage2_model, "hierarchical")) {
+    preflight <- tf_prepare_stan_data(analysis_object, gamma, eta, r_dir,
+      confidence_min, confidence_max, control_level, disease_level,
+      nuisance_prior_scale = nuisance_prior_scale, target_interaction = TRUE)
+    tf_hierarchical_sample_design(preflight, pbmc[[]], sample_column)
+  }
 
   stage1_started <- Sys.time()
   stage1_fit <- run_TF_directional_model(
@@ -194,7 +231,23 @@ TF_regulatory_direction_computation <- function(
   )
 
   stage2_started <- Sys.time()
-  stage2_fit <- if (identical(stage2_model, "no_interaction")) {
+  stage2_fit <- if (identical(stage2_model, "hierarchical")) {
+    run_TF_stage2_hierarchical_model(
+      analysis_object = filtered_analysis_object, stage1_fit_result = stage1_fit,
+      metadata = pbmc[[]], sample_column = sample_column,
+      direction_effect = direction_effect, beta_sd_floor = beta_sd_floor,
+      stage1_sd_multiplier = stage1_sd_multiplier, control_level = control_level,
+      disease_level = disease_level, confidence_min = confidence_min,
+      confidence_max = confidence_max, nuisance_prior_scale = nuisance_prior_scale,
+      target_interaction_sd = target_interaction_sd,
+      sample_intercept_sd_scale = sample_intercept_sd_scale,
+      sample_slope_sd_scale = sample_slope_sd_scale,
+      chains = stage2_chains, parallel_chains = stage2_chains,
+      iter_warmup = stage2_iter_warmup, iter_sampling = stage2_iter_sampling,
+      seed = seed + 1L, refresh = refresh, compute_loo = compute_loo,
+      force_recompile = force_recompile, adapt_delta = stage2_adapt_delta,
+      max_treedepth = stage2_max_treedepth)
+  } else if (identical(stage2_model, "no_interaction")) {
     run_TF_stage2_directional_model(
       analysis_object = filtered_analysis_object, stage1_fit_result = stage1_fit,
       stan_file = NULL, direction_effect = direction_effect, beta_sd_floor = beta_sd_floor,
@@ -231,6 +284,7 @@ TF_regulatory_direction_computation <- function(
   direction_summary <- data.frame(
     target_tf = target_tf, target_gene = target_gene,
     stage1_inference = stage1_inference, stage2_model = stage2_model,
+    data_type = data_type,
     posterior_mean = mean(target_beta), posterior_median = stats::median(target_beta),
     q05 = unname(stats::quantile(target_beta, 0.05)),
     q95 = unname(stats::quantile(target_beta, 0.95)),
@@ -254,6 +308,8 @@ TF_regulatory_direction_computation <- function(
 
   invisible(structure(list(
     target_tf = target_tf, target_gene = target_gene,
+    data_type = data_type, sample_column = sample_column,
+    stage2_model = stage2_model, stage2_requested_model = stage2_requested_model,
     output_dir = if (persist_output) normalizePath(work_dir, winslash = "/", mustWork = TRUE) else NULL,
     adjustment = adjustment, analysis_object = analysis_object,
     filtered_analysis_object = filtered_analysis_object, stage1_fit = stage1_fit,

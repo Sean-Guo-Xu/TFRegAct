@@ -102,6 +102,7 @@ tf_stage1_screening_validate_input <- function(screening_input) {
     tf_stage1_screening_stop("`screening_input` must be a non-empty nested list.")
   }
   if (!isTRUE(attr(screening_input, "recursive_adjustment_search")) &&
+      !identical(attr(screening_input, "adjustment_algorithm"), "minimum_vertex_cut_v1") &&
       !isTRUE(attr(screening_input, "direct_confounders_only"))) {
     tf_stage1_screening_stop(
       "`screening_input` must contain a validated causal adjustment search."

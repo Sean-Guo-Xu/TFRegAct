@@ -150,12 +150,20 @@ prepare_TF_stage1_screening_stan_data <- function(
   )
 }
 
-tf_stage1_input_query_one_adjustment <- function(target_gene, target_tf, config) {
+tf_stage1_input_query_one_adjustment <- function(target_gene, target_tf, config,
+                                                network_bundle = NULL) {
   tryCatch({
+    if (is.null(network_bundle)) {
+      network_bundle <- get0(".tf_stage1_input_worker_network_bundle",
+                             envir = .GlobalEnv, inherits = FALSE)
+    }
+    if (is.null(network_bundle)) {
+      network_bundle <- find_adjustment_dagitty_extract_bundle(edge_file = config$edge_file)
+    }
     result <- find_adjustment_dagitty(
       tf = target_tf,
       gene = target_gene,
-      network = list(dagitty_bundle = .tf_stage1_input_worker_network_bundle),
+      network = list(dagitty_bundle = network_bundle),
       edge_file = config$edge_file,
       outdir = config$outdir,
       beta = config$beta,
@@ -174,6 +182,8 @@ tf_stage1_input_query_one_adjustment <- function(target_gene, target_tf, config)
       recommended_adjustment_set = result$recommended_adjustment_set,
       adjustment_sets_evaluated = nrow(result$adjustment_set_scores),
       selected_adjustment_set_size = nrow(result$recommended_adjustment_set),
+      adjustment_algorithm = result$adjustment_search$algorithm,
+      minimum_cardinality = result$adjustment_search$minimum_cardinality,
       error = NA_character_
     )
   }, error = function(e) {
@@ -189,7 +199,7 @@ tf_stage1_input_query_one_adjustment <- function(target_gene, target_tf, config)
   })
 }
 
-#' Find a validated recursive adjustment set for each direct target gene.
+#' Find an exact minimum-cardinality back-door adjustment set per target gene.
 query_TF_target_adjustment_sets <- function(
   target_tf,
   target_genes,
@@ -197,7 +207,7 @@ query_TF_target_adjustment_sets <- function(
   outdir = "adjustment_output",
   beta = 2,
   confounder_confidence_threshold = 4,
-  search_starts = 8L,
+  search_starts = 1L,
   search_seed = 123L,
   cores = 4L,
   checkpoint_count = 2L,
@@ -222,7 +232,7 @@ query_TF_target_adjustment_sets <- function(
     outdir = outdir,
     beta = as.numeric(beta),
     confounder_confidence_threshold = as.numeric(confounder_confidence_threshold),
-    search_starts = search_starts,
+    search_starts = 1L,
     search_seed = search_seed
   )
   results <- stats::setNames(vector("list", length(target_genes)), target_genes)
@@ -232,15 +242,19 @@ query_TF_target_adjustment_sets <- function(
   attr(results, "search_seed") <- config$search_seed
   attr(results, "max_adjustment_sets") <- config$search_starts
   attr(results, "direct_confounders_only") <- FALSE
-  attr(results, "recursive_adjustment_search") <- TRUE
+  attr(results, "recursive_adjustment_search") <- FALSE
+  attr(results, "adjustment_algorithm") <- "minimum_vertex_cut_v1"
+  attr(results, "adjustment_beta") <- config$beta
+  attr(results, "network_source") <- config$edge_file
   if (!is.null(output_file)) {
     output_file <- normalizePath(output_file, winslash = "/", mustWork = FALSE)
     dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
     if (isTRUE(resume) && file.exists(output_file)) {
       cached <- readRDS(output_file)
-      cache_compatible <- identical(attr(cached, "recursive_adjustment_search"), TRUE) &&
-        identical(as.integer(attr(cached, "search_starts")), config$search_starts) &&
-        identical(as.integer(attr(cached, "search_seed")), config$search_seed) &&
+      cache_compatible <- identical(attr(cached, "target_tf"), target_tf) &&
+        identical(attr(cached, "adjustment_algorithm"), "minimum_vertex_cut_v1") &&
+        identical(attr(cached, "adjustment_beta"), config$beta) &&
+        identical(attr(cached, "network_source"), config$edge_file) &&
         isTRUE(all.equal(
           as.numeric(attr(cached, "confounder_confidence_threshold")),
           config$confounder_confidence_threshold
@@ -312,7 +326,9 @@ query_TF_target_adjustment_sets <- function(
       }
       for (gene_index in seq_along(pending)) {
         gene <- pending[[gene_index]]
-        results[[gene]] <- tf_stage1_input_query_one_adjustment(gene, target_tf, config)
+        results[[gene]] <- tf_stage1_input_query_one_adjustment(
+          gene, target_tf, config, network_bundle = .tf_stage1_input_worker_network_bundle
+        )
         if (!is.null(output_file) && gene_index %in% checkpoint_genes) {
           saveRDS(results, output_file)
         }
@@ -325,7 +341,10 @@ query_TF_target_adjustment_sets <- function(
   attr(results, "search_seed") <- config$search_seed
   attr(results, "max_adjustment_sets") <- config$search_starts
   attr(results, "direct_confounders_only") <- FALSE
-  attr(results, "recursive_adjustment_search") <- TRUE
+  attr(results, "recursive_adjustment_search") <- FALSE
+  attr(results, "adjustment_algorithm") <- "minimum_vertex_cut_v1"
+  attr(results, "adjustment_beta") <- config$beta
+  attr(results, "network_source") <- config$edge_file
   if (!is.null(output_file)) saveRDS(results, output_file)
   results
 }
@@ -461,7 +480,8 @@ build_TF_stage1_screening_input <- function(
   attr(result, "directional_prior") <- TRUE
   attr(result, "edge_direction_included") <- TRUE
   attr(result, "direct_confounders_only") <- FALSE
-  attr(result, "recursive_adjustment_search") <- TRUE
+  attr(result, "recursive_adjustment_search") <- FALSE
+  attr(result, "adjustment_algorithm") <- attr(adjustment_results, "adjustment_algorithm")
   attr(result, "cell_count") <- ncol(seurat_obj)
   attr(result, "batch_column") <- batch_column
   attr(result, "use_batch") <- input_use_batch

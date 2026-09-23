@@ -9,6 +9,8 @@ if (!methods::isClass("TFComputationInput")) {
       seurat_obj = "ANY",
       target_tf = "character",
       target_gene = "character",
+      data_type = "character",
+      sample_column = "character",
       condition_column = "character",
       control_level = "character",
       disease_level = "character",
@@ -40,8 +42,11 @@ create_TF_computation_input <- function(
   layer = "data",
   Y_exp = NULL,
   libsize = NULL,
-  network_edge_file = .tfregact_default_network_file()
+  network_edge_file = .tfregact_default_network_file(),
+  data_type = c("single_cell", "bulk"),
+  sample_column = NULL
 ) {
+  data_type <- match.arg(data_type)
   if (is.null(seurat_obj)) tf_computation_input_stop("`seurat_obj` must be supplied.")
   metadata <- tryCatch(seurat_obj[[]], error = function(e) NULL)
   if (!is.data.frame(metadata)) tf_computation_input_stop("`seurat_obj` must be a Seurat-like object supporting `object[[]]` metadata extraction.")
@@ -52,6 +57,10 @@ create_TF_computation_input <- function(
     value
   }
   target_tf <- scalar_character(target_tf, "target_tf")
+  sample_column <- if (is.null(sample_column)) NA_character_ else scalar_character(sample_column, "sample_column")
+  if (!is.na(sample_column) && !(sample_column %in% colnames(metadata))) {
+    tf_computation_input_stop("Biological-sample metadata column `%s` was not found.", sample_column)
+  }
   target_gene <- if (is.null(target_gene)) NA_character_ else scalar_character(target_gene, "target_gene")
   has_condition <- !is.null(condition_column)
   condition_column <- if (has_condition) {
@@ -77,6 +86,7 @@ create_TF_computation_input <- function(
   methods::new(
     "TFComputationInput", seurat_obj = seurat_obj, target_tf = target_tf,
     target_gene = target_gene,
+    data_type = data_type, sample_column = sample_column,
     condition_column = condition_column, control_level = control_level,
     disease_level = disease_level, assay = assay, layer = layer, Y_exp = Y_exp,
     libsize = libsize, network_edge_file = network_edge_file
@@ -93,6 +103,10 @@ tf_computation_input_values <- function(input) {
     seurat_obj = methods::slot(input, "seurat_obj"),
     target_tf = methods::slot(input, "target_tf"),
     target_gene = methods::slot(input, "target_gene"),
+    data_type = tryCatch(methods::slot(input, "data_type"), error = function(e) {
+      tf_computation_input_stop("Recreate this legacy input with explicit `data_type` and `sample_column`.")
+    }),
+    sample_column = optional_slot("sample_column"),
     condition_column = optional_slot("condition_column"),
     control_level = optional_slot("control_level"),
     disease_level = optional_slot("disease_level"),

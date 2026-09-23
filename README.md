@@ -1,7 +1,8 @@
 # TFRegAct
 
 TFRegAct is an R package for Bayesian inference of transcription-factor (TF)
-regulation and cell-level TF activity from single-cell RNA-seq data.
+regulation and expression-anchored TF activity from bulk or single-cell RNA-seq data.
+Bulk observations are samples; single-cell analyses use a selected cell population.
 
 The package provides four main steps:
 
@@ -33,8 +34,24 @@ TF-to-gene edge. Supply `batch_column` only when batch information is present;
 otherwise leave it as `NULL`. Condition is also optional for regulatory-edge
 inference: set `condition_column = NULL` when it is unavailable or should not
 be adjusted for. Internally, available condition and batch variables are
-encoded in one nuisance design matrix, so Stage 1 and Stage 2 each use a single
-Stan model for all four combinations (neither, either one, or both).
+encoded in a nuisance design matrix. Declare `data_type` explicitly as
+`"single_cell"` (the default) or `"bulk"`. For single-cell data with condition,
+also supply `sample_column`, identifying independent biological samples,
+not condition labels or sequencing batches.
+
+Regulatory Stage 2 is selected automatically:
+
+| Data type | Condition | Stage 2 |
+|---|---|---|
+| Single-cell | Present | Hierarchical sample intercepts and focal-TF slopes, including a condition slope difference |
+| Bulk | Present | Original model selected by `stage2_model` |
+| Either | Absent (`condition_column = NULL`) | Original model without a condition interaction |
+
+Stage 1 remains unchanged. `stage2_model` controls the bulk branch only when
+condition is present; it does not override the conditioned single-cell route.
+See [the hierarchical algorithm](docs/regulatory_hierarchical.md) for the model,
+input checks and interpretation. Recreate previously serialized input objects
+with the new constructor so that their type and biological-sample column are explicit.
 
 ```r
 library(TFRegAct)
@@ -43,6 +60,8 @@ edge_input <- create_TF_computation_input(
   seurat_obj = macrophages,
   target_tf = "ATF4",
   target_gene = "ATF3",
+  data_type = "single_cell",
+  sample_column = "orig.ident", # biological sample, not condition or batch
   condition_column = "sample",
   control_level = "Normal",
   disease_level = "AAA"
@@ -57,22 +76,116 @@ edge_fit <- TF_regulatory_direction_computation(
 edge_fit$direction_summary
 ```
 
+The conditioned single-cell model centers retained TF predictors within each
+biological sample and estimates sample-specific intercepts and focal-TF slopes.
+It keeps the original Stage 1 and uses its posterior summaries to construct
+the Stage 2 Normal priors. Each condition must have at least two biological
+samples with within-sample focal-TF variation. Missing sample IDs, samples
+spanning conditions, and a rank-deficient condition/batch design are rejected.
+
+Inspect the selected route, sample map, and condition-specific estimates with:
+
+```r
+edge_fit$stage2_model
+edge_fit$stage2_fit$sample_map
+edge_fit$stage2_fit$fit$summary(c(
+  "beta_target_control", "beta_target_disease", "beta_target_delta"
+))
+edge_fit$stage2_fit$fit$diagnostic_summary()
+```
+
+`beta_target_delta` is the disease-minus-control slope difference. The main
+direction summary uses the midpoint coefficient across the two conditions;
+it does not by itself establish a difference between conditions.
+
+### Bulk input
+
+Arrange raw counts, normalized TF predictors and sample metadata in a Seurat
+container with one column per bulk sample. The response uses raw counts; the
+normalized layer supplies TF predictors. Set `data_type = "bulk"` explicitly:
+
+```r
+bulk_input <- create_TF_computation_input(
+  seurat_obj = bulk_samples,
+  target_tf = "ATF4", target_gene = "ATF3",
+  data_type = "bulk",
+  condition_column = "condition",
+  control_level = "control", disease_level = "disease"
+)
+bulk_fit <- TF_regulatory_direction_computation(
+  input = bulk_input,
+  stage2_model = "target_interaction", # or "no_interaction" (default)
+  batch_column = NULL
+)
+```
+
+### Input without condition
+
+For either data type, `condition_column = NULL` selects the original Stage 2
+without a condition interaction. Biological-sample IDs are not required for
+this route. For example:
+
+```r
+unconditioned_input <- create_TF_computation_input(
+  seurat_obj = macrophages,
+  target_tf = "ATF4", target_gene = "ATF3",
+  data_type = "single_cell", condition_column = NULL
+)
+unconditioned_fit <- TF_regulatory_direction_computation(
+  input = unconditioned_input, batch_column = "batch"
+)
+```
+
+When supplying an input object, its `data_type` and `sample_column` determine
+routing. If repeated in the workflow call, their values must agree with the
+object. Restart R after updating the package and recreate older input objects
+with the new constructor. This routing change applies to regulatory-direction
+inference; the activity/EM workflow retains its existing models.
+
+### Validation
+
+The complete regulatory workflow was tested on 4,000 macrophages from 10
+biological samples and two batches for EP300 to MTOR, with batch adjustment.
+Both stages used four MCMC chains, each with 400 warmup and 600 sampling
+iterations. Neither stage had divergent transitions or maximum-tree-depth
+hits; the largest R-hat among the checked parameters was 1.0059.
+Stage 1 removed all five adjustment TFs in that run, so a separate synthetic
+two-predictor fit checked the hierarchical model with retained covariates.
+These are execution and sampler checks, not evidence of biological accuracy.
+
+`tests/regulatory-routing.R` checks all eight combinations of data type,
+condition availability and legacy Stage 2 choice, together with metadata
+alignment, biological-replicate guards and prior transfer. It uses model
+substitutes for the dispatch checks and does not require MCMC or private data.
+
 ## Basic usage: cell-level TF activity
 
 For activity inference, omit `target_gene`. The function identifies direct
 targets, finds target-specific adjustment sets, performs screening and MCMC
 refinement, then returns a Seurat object containing `<TF>_activity_A`.
 By default, direct target edges and prior-network edges must have confidence
-at least 4. Adjustment sets are selected from eight randomized starts, using
-the smallest valid set first and path-edge confidence to break size ties.
+at least 4. Both workflows use an exact minimum-vertex-cut solver on the
+moralized ancestor subgraph of the back-door graph. The selected set has the
+fewest nodes under the current DAG and the package's Pearl back-door constraint
+(no adjustment for descendants of the target TF). This does not establish that
+the supplied DAG is biologically correct. One representative minimum set is
+returned; path confidence is reported but is not optimized among equal-size
+solutions. All selected adjustment variables are retained in regression metrics,
+including necessary variables without a directed path to the target gene;
+their target-gene direction is unknown and confidence falls back to a directed
+path towards the target TF. The original confidence filtering and DAG projection are
+unchanged. Legacy restart/search-limit arguments do not affect the exact solver;
+activity queries still parallelize across target genes using `cores`.
+Old recursive-search caches are invalidated automatically.
 The activity prescreen and regulatory Stage 1 share the same directional
 Laplace Stan model and the same fitting function. Condition and batch terms are
 optional and are encoded in one nuisance design matrix. Activity uses the
 shared model with mean-field variational inference. Regulatory-edge Stage 1
 uses MCMC by default, but can instead use mean-field or full-rank variational
 inference for faster approximate screening. The subsequent activity Normal-prior MCMC and
-regulatory Stage 2 call the same negative-binomial Stan model and MCMC fitting
-function. In both workflows, the retained Stage 1 posterior is converted in R
+non-hierarchical regulatory Stage 2 call the same negative-binomial Stan model
+and MCMC fitting function. Conditioned single-cell regulatory Stage 2 instead
+uses the sample hierarchy. In both workflows, the retained Stage 1 posterior is converted in R
 to `beta_prior_mean` and `beta_prior_sd`; network confidence is not applied a
 second time in Stage 2. This transfer is controlled by `direction_effect`,
 `beta_sd_floor`, and `stage1_sd_multiplier`. Set `condition_column = NULL` to
@@ -126,6 +239,8 @@ when diagnostics indicate a problem.
 | `target_tf` | `NULL` | Target TF symbol. It may instead be supplied through `input`. |
 | `target_gene` | `NULL` | Target gene symbol. It may instead be supplied through `input`. |
 | `input` | `NULL` | A `TFComputationInput` object. Do not also supply `seurat_obj` or `data_file`. |
+| `data_type` | `"single_cell"` | `"single_cell"` or `"bulk"`; normally stored in the input object. |
+| `sample_column` | `NULL` | Biological-sample ID column, required for conditioned single-cell regulation; normally stored in the input object. |
 | `seurat_obj` | `NULL` | In-memory Seurat object when `input` is not used. |
 | `data_file` | `NULL` | `.RData` file containing an object named `pbmc`; alternative to `seurat_obj`. |
 | `output` | `FALSE` | `FALSE` returns results in memory, `TRUE` creates `<TF>_<gene>_output`, and a character value specifies a directory. |
@@ -147,9 +262,9 @@ when diagnostics indicate a problem.
 |---|---:|---|
 | `network_edge_file` | package cache | FullMap regulatory-network file; normally left unchanged. |
 | `confounder_confidence_threshold` | `3` | Minimum network confidence for candidate confounder edges. |
-| `adjustment_search_starts` | `8` | Randomized recursive adjustment-set searches. |
-| `adjustment_search_cores` | `4` | Cores used for adjustment-set search. |
-| `max_adjustment_sets` | `NULL` | Deprecated compatibility argument; ignored in favour of `adjustment_search_starts`. |
+| `adjustment_search_starts` | `1` | Compatibility argument; ignored. Exact minimum-cut search runs once per query, without random restarts. |
+| `adjustment_search_cores` | `4` | Compatibility argument for single-query search; the minimum-cut solver uses one core. |
+| `max_adjustment_sets` | `NULL` | Deprecated compatibility argument; ignored by minimum-cut search. |
 | `dagitty_beta` | `2` | Relative weight given to confidence on paths towards the target gene when adjustment sets are scored. |
 | `gamma` | `1` | Base Stage 1 beta-prior scale. This is the regulatory-interface counterpart of activity `beta_prior_scale`. |
 | `eta` | `0.5` | Exponent controlling how strongly confidence changes the beta-prior scale. |
@@ -174,7 +289,9 @@ when diagnostics indicate a problem.
 | `stage1_filter_interval` | `c(5, 95)` | Posterior percentile interval used to retain TF coefficients; the default is a central 90% interval. |
 | `correlation_filter` | `TRUE` | Remove redundant, direction-consistent highly correlated TF predictors. |
 | `correlation_threshold` | `0.7` | Absolute correlation threshold used by the redundancy filter. |
-| `stage2_model` | `"no_interaction"` | Use `"no_interaction"` or `"target_interaction"`; the latter estimates a target-TF-by-condition effect. |
+| `stage2_model` | `"no_interaction"` | Bulk with condition: `"no_interaction"` or `"target_interaction"`. Conditioned single-cell data automatically use the hierarchy; absent condition forces the original no-interaction model. |
+| `sample_intercept_sd_scale` | `1` | Half-Normal scale for sample-intercept heterogeneity in hierarchical Stage 2. |
+| `sample_slope_sd_scale` | `1` | Half-Normal scale for sample focal-TF slope heterogeneity in hierarchical Stage 2. |
 | `direction_effect` | `0.2` | Direction-dependent shift added to the Stage 1 beta mean when constructing the Stage 2 Normal prior. |
 | `beta_sd_floor` | `0.5` | Minimum Stage 2 beta-prior standard deviation. |
 | `stage1_sd_multiplier` | `1.5` | Multiplier applied to the Stage 1 beta posterior SD for the Stage 2 prior. |
@@ -224,8 +341,8 @@ when diagnostics indicate a problem.
 | `target_confidence_threshold` | `4` | Minimum confidence for direct target-TF-to-gene edges entering activity inference. |
 | `target_confidence_override` | `NULL` | Optional named values or data frame replacing selected target-edge confidence values. |
 | `confounder_confidence_threshold` | `4` | Minimum network confidence for candidate confounder edges. |
-| `adjustment_search_starts` | `8` | Randomized recursive adjustment-set searches per target gene. |
-| `max_adjustment_sets` | `NULL` | Deprecated compatibility argument; ignored in favour of `adjustment_search_starts`. |
+| `adjustment_search_starts` | `1` | Compatibility argument; ignored. Exact minimum-cut search runs once per target gene. Activity `cores` still parallelizes different target genes. |
+| `max_adjustment_sets` | `NULL` | Deprecated compatibility argument; ignored by minimum-cut search. |
 | `dagitty_beta` | `2` | Relative weight given to confidence on paths towards each target gene. |
 | `beta_prior_scale` | `1` | Base Stage 1 beta-prior scale. |
 | `eta` | `0.5` | Exponent controlling how strongly confidence changes the beta-prior scale. |

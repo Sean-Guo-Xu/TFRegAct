@@ -573,13 +573,13 @@ find_adjustment_dagitty_build_recommended_metrics <- function(
 
   vars <- unique(c(recommended_variables, tf_query, gene_query))
   backdoor_vars <- setdiff(vars, tf_query)
-  backdoor_paths <- tf_recursive_adjustment_score_paths(
+  backdoor_paths <- tf_adjustment_score_paths(
     dag_edges = edges,
     adjustment_set = backdoor_vars,
     outcome = gene_query,
     exposure = tf_query
   )$details
-  target_path <- tf_recursive_adjustment_score_paths(
+  target_path <- tf_adjustment_score_paths(
     dag_edges = edges,
     adjustment_set = tf_query,
     outcome = gene_query
@@ -588,6 +588,12 @@ find_adjustment_dagitty_build_recommended_metrics <- function(
   directed_paths <- directed_paths[
     match(vars, directed_paths$variable), , drop = FALSE
   ]
+  fallback_vars <- directed_paths$variable[
+    directed_paths$variable %in% recommended_variables & !is.finite(directed_paths$path_length)
+  ]
+  tf_paths <- if (length(fallback_vars)) tf_adjustment_score_paths(
+    dag_edges = edges, adjustment_set = fallback_vars, outcome = tf_query
+  )$details else NULL
   out <- lapply(vars, function(v) {
     path_index <- match(v, directed_paths$variable)
     path_distance <- directed_paths$path_length[[path_index]]
@@ -595,6 +601,13 @@ find_adjustment_dagitty_build_recommended_metrics <- function(
     path_direction <- directed_paths$path_direction[[path_index]]
     path_effect <- directed_paths$path_effect[[path_index]]
     to_tf <- find_adjustment_dagitty_best_path_metric(tf_tree, v)
+    # For a separator with no directed Y-path, use its directed path to T,
+    # never an undirected shortcut through the specially retained query edge.
+    if (!is.finite(path_distance) && v %in% recommended_variables) {
+      tf_index <- match(v, tf_paths$variable)
+      to_tf <- list(distance = tf_paths$path_length[[tf_index]],
+                    avg_confidence = tf_paths$path_mean_confidence[[tf_index]])
+    }
     avg_to_gene <- if (is.finite(path_distance) && path_distance > 0) {
       path_confidence
     } else {
@@ -639,7 +652,7 @@ find_adjustment_dagitty_recommended_metrics <- function(
   beta = 2,
   overall_confidence_threshold = 3,
   build_if_missing = TRUE,
-  search_starts = 8L,
+  search_starts = 1L,
   search_cores = 4L,
   search_seed = 123L,
   max_adjustment_sets = NULL,
@@ -729,12 +742,14 @@ find_adjustment_dagitty_recommended_metrics <- function(
     direct_edges = source_edges
   )
   keep_forced <- metrics$tf %in% c(tf_query, gene_query)
-  keep_adjustment_path <- metrics$tf %in% recommended_variables &
-    is.finite(metrics$distance_to_gene_A) & metrics$distance_to_gene_A > 0
+  keep_adjustment_path <- metrics$tf %in% recommended_variables
   filtered_metrics <- metrics[keep_forced | keep_adjustment_path, , drop = FALSE]
   filtered_metrics$meets_prior_edge_threshold <-
     keep_forced[keep_forced | keep_adjustment_path] |
-    filtered_metrics$avg_confidence_to_gene_A >= overall_confidence_threshold
+    ifelse(is.finite(filtered_metrics$distance_to_gene_A) &
+             filtered_metrics$distance_to_gene_A > 0,
+           filtered_metrics$avg_confidence_to_gene_A,
+           filtered_metrics$avg_confidence_to_tf_B) >= overall_confidence_threshold
   if (any(!filtered_metrics$meets_prior_edge_threshold)) {
     stop(
       "Saved adjustment set is incompatible with the requested prior-edge confidence threshold.",
@@ -782,7 +797,7 @@ find_adjustment_dagitty_run <- function(
   outdir = "adjustment_output",
   beta = 2,
   overall_confidence_threshold = 3,
-  search_starts = 8L,
+  search_starts = 1L,
   search_cores = 4L,
   search_seed = 123L,
   max_iterations = 1000L,
@@ -812,7 +827,7 @@ find_adjustment_dagitty_run <- function(
   }
   if (!is.null(max_adjustment_sets)) {
     warning(
-      "`max_adjustment_sets` is retained only for compatibility; use `search_starts`.",
+      "`max_adjustment_sets` is ignored; minimum-cut search returns one minimum-cardinality set.",
       call. = FALSE
     )
   }
@@ -896,7 +911,7 @@ find_adjustment_dagitty_run <- function(
   dag_edges_out$direction <- find_adjustment_dagitty_effect_to_direction(
     dag_edges_out$effect
   )
-  recursive_search <- tf_recursive_adjustment_search(
+  recursive_search <- tf_adjustment_search(
     dag_edges = dag_edges_out,
     exposure = tf_query,
     outcome = gene_query,
@@ -961,21 +976,26 @@ find_adjustment_dagitty_run <- function(
     direct_edges = edges
   )
   keep_forced <- recommended_metrics$tf %in% c(tf_query, gene_query)
-  keep_adjustment_path <- recommended_metrics$tf %in% recommended_res$recommended_variables &
-    is.finite(recommended_metrics$distance_to_gene_A) &
-    recommended_metrics$distance_to_gene_A > 0
+  # A separator can be necessary even without a directed path to Y (e.g. a
+  # collider-control parent). Never discard members of the validated set.
+  keep_adjustment_path <- recommended_metrics$tf %in% recommended_res$recommended_variables
   filtered_recommended_metrics <- recommended_metrics[
     keep_forced | keep_adjustment_path, , drop = FALSE
   ]
   filtered_recommended_metrics$meets_prior_edge_threshold <-
     keep_forced[keep_forced | keep_adjustment_path] |
-    filtered_recommended_metrics$avg_confidence_to_gene_A >=
-      overall_confidence_threshold
+    ifelse(is.finite(filtered_recommended_metrics$distance_to_gene_A) &
+             filtered_recommended_metrics$distance_to_gene_A > 0,
+           filtered_recommended_metrics$avg_confidence_to_gene_A,
+           filtered_recommended_metrics$avg_confidence_to_tf_B) >= overall_confidence_threshold
   if (any(!filtered_recommended_metrics$meets_prior_edge_threshold)) {
     stop(
       "Internal error: an adjustment path violates the prior-edge confidence threshold.",
       call. = FALSE
     )
+  }
+  if (!all(winner$final_set %in% filtered_recommended_metrics$tf)) {
+    stop("Internal error: adjustment members were lost from regression metrics.", call. = FALSE)
   }
   rownames(filtered_recommended_metrics) <- NULL
   node_meta_out$role <- "other"
@@ -1029,7 +1049,10 @@ find_adjustment_dagitty_run <- function(
     sprintf("Local DAG nodes: %d", length(local_nodes)),
     sprintf("Local DAG edges: %d", nrow(dag_edges_out)),
     sprintf("Candidate confounders: %d", nrow(candidate_df)),
-    sprintf("Randomized starts: %d", recursive_search$n_starts),
+    sprintf("Adjustment algorithm: %s", recursive_search$algorithm),
+    sprintf("Minimum cardinality certified: %s", recursive_search$optimality_certified),
+    "Confidence is reported, not optimized among equal-size minimum cuts.",
+    sprintf("Solver runs: %d", recursive_search$n_starts),
     sprintf("Search cores: %d", recursive_search$cores),
     sprintf("Winning start: %d", winner$start_id),
     sprintf("Winning adjustment size: %d", length(winner$final_set)),
@@ -1071,6 +1094,7 @@ find_adjustment_dagitty_run <- function(
     filtered_recommended_adjustment_metrics = filtered_recommended_metrics,
     adjustment_set_scores = recommended_res$set_scores,
     randomized_search = recursive_search,
+    adjustment_search = recursive_search,
     dagitty_graph = dagitty_string,
     files = file_map,
     summary = summary_lines
@@ -1087,7 +1111,7 @@ find_adjustment_dagitty <- function(
   outdir = "adjustment_output",
   beta = 2,
   overall_confidence_threshold = 3,
-  search_starts = 8L,
+  search_starts = 1L,
   search_cores = 4L,
   search_seed = 123L,
   max_adjustment_sets = NULL,
@@ -1133,7 +1157,7 @@ find_adjustment_dagitty_main <- function() {
     outdir = find_adjustment_dagitty_get_arg(args, "--outdir", "adjustment_output"),
     beta = as.numeric(find_adjustment_dagitty_get_arg(args, "--beta", "2")),
     overall_confidence_threshold = as.numeric(find_adjustment_dagitty_get_arg(args, "--overall_confidence_threshold", "3")),
-    search_starts = as.integer(find_adjustment_dagitty_get_arg(args, "--search_starts", "8")),
+    search_starts = as.integer(find_adjustment_dagitty_get_arg(args, "--search_starts", "1")),
     search_cores = as.integer(find_adjustment_dagitty_get_arg(args, "--search_cores", "4")),
     search_seed = as.integer(find_adjustment_dagitty_get_arg(args, "--search_seed", "123")),
     write_full_outputs = tolower(find_adjustment_dagitty_get_arg(args, "--write_full_outputs", "false")) == "true",

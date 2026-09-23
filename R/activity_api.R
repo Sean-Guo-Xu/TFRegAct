@@ -65,7 +65,7 @@ TF_activity_computation <- function(
   target_confidence_threshold = 4,
   target_confidence_override = NULL,
   confounder_confidence_threshold = 4,
-  adjustment_search_starts = 8L,
+  adjustment_search_starts = 1L,
   max_adjustment_sets = NULL,
   dagitty_beta = 2,
   beta_prior_scale = 1,
@@ -101,7 +101,7 @@ TF_activity_computation <- function(
   .tf_activity_computation_load_dependencies()
   if (!is.null(max_adjustment_sets)) {
     warning(
-      "`max_adjustment_sets` is obsolete and ignored; use `adjustment_search_starts`.",
+      "`max_adjustment_sets` is obsolete and ignored; minimum-cut search returns one minimum-cardinality set.",
       call. = FALSE
     )
   }

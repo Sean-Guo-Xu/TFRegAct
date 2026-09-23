@@ -873,6 +873,9 @@ filter_TF_analysis_object_by_beta_ci <- function(
   )
 
   attr(filtered_object, "beta_ci_filter") <- filter_table
+  filtered_object$data_type <- analysis_object$data_type
+  filtered_object$sample_column <- analysis_object$sample_column
+  filtered_object$biological_sample <- analysis_object$biological_sample
   attr(filtered_object, "stage1_beta_summary") <- filter_table[keep, , drop = FALSE]
   attr(filtered_object, "beta_ci_interval") <- interval
   attr(filtered_object, "tf_correlation_matrix") <- correlation_result$cor_mat
