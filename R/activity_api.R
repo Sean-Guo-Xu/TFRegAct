@@ -90,7 +90,6 @@ TF_activity_computation <- function(
   mcmc_iter_sampling = 600L,
   mcmc_adapt_delta = 0.95,
   mcmc_max_treedepth = 12L,
-  mcmc_draws_for_em = 1500L,
   nuisance_draw_count = 100L,
   active_prior_zero = 0.2,
   em_control = list(),
@@ -150,7 +149,7 @@ TF_activity_computation <- function(
   input_build_elapsed_seconds <- as.numeric(difftime(Sys.time(), input_build_started, units = "secs"))
 
   pipeline_started <- Sys.time()
-  pipeline_result <- run_TF_three_stage_pipeline(screening_input = screening_input, output_dir = work_dir, cores = cores, seed = seed, prescreen_target_interval = prescreen_target_interval, prescreen_confounder_interval = prescreen_confounder_interval, prescreen_variational_iter = prescreen_variational_iter, prescreen_output_samples = prescreen_output_samples, direction_effect = direction_effect, beta_sd_floor = beta_sd_floor, stage1_sd_multiplier = stage1_sd_multiplier, stage2_alpha_prior_sd = stage2_alpha_prior_sd, mcmc_target_interval = mcmc_target_interval, mcmc_confounder_interval = mcmc_confounder_interval, mcmc_chains = mcmc_chains, mcmc_iter_warmup = mcmc_iter_warmup, mcmc_iter_sampling = mcmc_iter_sampling, mcmc_adapt_delta = mcmc_adapt_delta, mcmc_max_treedepth = mcmc_max_treedepth, mcmc_draws_for_em = mcmc_draws_for_em, nuisance_draw_count = nuisance_draw_count, active_prior_zero = active_prior_zero, em_control = em_control, resume = resume, force_refit = force_refit, force_recompile = force_recompile)
+  pipeline_result <- run_TF_three_stage_pipeline(screening_input = screening_input, output_dir = work_dir, cores = cores, seed = seed, prescreen_target_interval = prescreen_target_interval, prescreen_confounder_interval = prescreen_confounder_interval, prescreen_variational_iter = prescreen_variational_iter, prescreen_output_samples = prescreen_output_samples, direction_effect = direction_effect, beta_sd_floor = beta_sd_floor, stage1_sd_multiplier = stage1_sd_multiplier, stage2_alpha_prior_sd = stage2_alpha_prior_sd, mcmc_target_interval = mcmc_target_interval, mcmc_confounder_interval = mcmc_confounder_interval, mcmc_chains = mcmc_chains, mcmc_iter_warmup = mcmc_iter_warmup, mcmc_iter_sampling = mcmc_iter_sampling, mcmc_adapt_delta = mcmc_adapt_delta, mcmc_max_treedepth = mcmc_max_treedepth, nuisance_draw_count = nuisance_draw_count, active_prior_zero = active_prior_zero, em_control = em_control, resume = resume, force_refit = force_refit, force_recompile = force_recompile)
   pipeline_elapsed_seconds <- as.numeric(difftime(Sys.time(), pipeline_started, units = "secs"))
 
   activity_column <- paste0(target_tf, "_activity_A")

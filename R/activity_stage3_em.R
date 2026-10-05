@@ -1014,8 +1014,9 @@ tf_em_summarize_draw_results <- function(draw_results, common, settings) {
 #' expression strongly downweights activity without forcing it to exactly zero.
 #'
 #' With `nuisance_draw_count = 0`, eta0 and phi use their Stage 2 posterior
-#' means and one EM fit is run. A positive count selects that many evenly spaced
-#' posterior draws and fits them independently; their activity posteriors form
+#' means and one EM fit is run. The default count is 100. A positive count
+#' reproducibly selects that many posterior draws without replacement
+#' and fits them independently; their activity posteriors form
 #' an equal-weight mixture. Explicit draw IDs remain available as an override.
 #' Stage 2 target-beta posterior means initialize EM but are not reused as
 #' priors. Every M-step instead uses the posterior-informed Normal prior that
@@ -1024,7 +1025,7 @@ tf_em_summarize_draw_results <- function(draw_results, common, settings) {
 #' than one nuisance draw is requested.
 run_TF_EM_latent_activity <- function(
   stage2_input,
-  nuisance_draw_count = 0L,
+  nuisance_draw_count = 100L,
   nuisance_draw_ids = NULL,
   cores = 4L,
   kappa = 1,
@@ -1080,10 +1081,10 @@ run_TF_EM_latent_activity <- function(
       nuisance_draw_ids <- 0L
       nuisance_mode <- "posterior_mean"
     } else {
-      nuisance_draw_ids <- floor(
-        (seq_len(nuisance_draw_count) - 0.5) *
-          stage2_input$S / nuisance_draw_count
-      ) + 1L
+      set.seed(seed)
+      nuisance_draw_ids <- sort(sample.int(
+        stage2_input$S, size = nuisance_draw_count, replace = FALSE
+      ))
       nuisance_mode <- "posterior_draws"
     }
   } else {

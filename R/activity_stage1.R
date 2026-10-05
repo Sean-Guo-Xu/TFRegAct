@@ -454,7 +454,11 @@ tf_stage1_screening_summarize_fit <- function(
     target_quantiles[2, target_lower_column] > 0 |
       target_quantiles[2, target_upper_column] < 0
 
-  retained_draw_count <- min(stage2_draw_count, nrow(joint_draws))
+  retained_draw_count <- if (is.null(stage2_draw_count)) {
+    nrow(joint_draws)
+  } else {
+    min(stage2_draw_count, nrow(joint_draws))
+  }
   retained_draw_index <- unique(as.integer(round(seq(
     1,
     nrow(joint_draws),
@@ -727,7 +731,9 @@ run_TF_stage1_screening_regressions <- function(
   variational_output_samples <- suppressWarnings(as.integer(
     variational_output_samples[[1]]
   ))
-  stage2_draw_count <- suppressWarnings(as.integer(stage2_draw_count[[1]]))
+  if (!is.null(stage2_draw_count)) {
+    stage2_draw_count <- suppressWarnings(as.integer(stage2_draw_count[[1]]))
+  }
   checkpoint_count <- suppressWarnings(as.integer(checkpoint_count[[1]]))
   retry_seed_offset <- suppressWarnings(as.integer(retry_seed_offset[[1]]))
   if (is.na(cores) || cores < 1L || is.na(chains) ||
@@ -739,7 +745,8 @@ run_TF_stage1_screening_regressions <- function(
       is.na(max_treedepth) || max_treedepth < 1L ||
       is.na(variational_iter) || variational_iter < 1L ||
       is.na(variational_output_samples) || variational_output_samples < 1L ||
-      is.na(stage2_draw_count) || stage2_draw_count < 1L ||
+      (!is.null(stage2_draw_count) &&
+       (is.na(stage2_draw_count) || stage2_draw_count < 1L)) ||
       is.na(checkpoint_count) || checkpoint_count < 0L ||
       is.na(retry_seed_offset) || retry_seed_offset < 0L) {
     tf_stage1_screening_stop("Invalid parallel or sampling configuration.")

@@ -371,8 +371,7 @@ when diagnostics indicate a problem.
 | `mcmc_iter_sampling` | `600` | Retained iterations per Stage 2 chain. |
 | `mcmc_adapt_delta` | `0.95` | Stage 2 HMC target acceptance probability. |
 | `mcmc_max_treedepth` | `12` | Stage 2 maximum HMC tree depth. |
-| `mcmc_draws_for_em` | `1500` | Maximum aligned Stage 2 draws retained for possible Stage 3 uncertainty propagation. |
-| `nuisance_draw_count` | `100` | Stage 2 nuisance draws fitted in Stage 3; `0` uses posterior means only. |
+| `nuisance_draw_count` | `100` | Stage 3 hyperparameter: number of nuisance-parameter draws sampled without replacement from all Stage 2 posterior draws, with one conditional EM fit per draw; `0` uses posterior means in a single fit. |
 | `active_prior_zero` | `0.2` | Prior active probability for a cell whose normalized target-TF expression is zero. The corresponding prior zero-activity probability is `0.8`. |
 | `em_control` | `list()` | Optional named list of advanced Stage 3 numerical controls described below. |
 | `resume` | `TRUE` | Resume compatible pipeline checkpoints. |
