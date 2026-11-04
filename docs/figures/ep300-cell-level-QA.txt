@@ -1,12 +1,5 @@
-EP300 exploratory cell-level comparison; existing model fits and scores unchanged.
-All cells included: Normal=6085, AAA=8542; no subsampling or score clipping.
-Two-sided unpaired Welch t-tests use untransformed cell activity values.
-Two nominal p-values without multiple-testing correction; full statistics and 95% CIs exported.
-The intervals and p-values assume independent cells and ignore sample clustering.
-Cells from the same biological sample are not independent biological replicates.
-Pooled KNN smoothing adds dependence. Treat both cell-level tests as exploratory.
-Box median and IQR; whiskers 1.5 IQR; all outlying cells displayed.
-Square-root display transform applied after box statistics; all four quartile summaries verified.
-Centered title; no subtitle or bottom caption. R-only, 600-dpi PNG and editable PDF/SVG.
-Source: docs/figures/smoothing-source-data.csv
-Original sample-level test results remain available and unchanged.
+Smoothed EP300 activity only; all 14627 cells retained.
+Basic README ggplot2 boxplot with median/IQR boxes and 1.5-IQR whiskers; no score clipping.
+Two-sided Welch t-test on untransformed cell scores: p=4.25923204079529e-13.
+Cell-level p-values are exploratory because cells within samples and smoothed scores are dependent.
+Linear axes; centered title; no subtitle or caption; R PNG/PDF/SVG export.
