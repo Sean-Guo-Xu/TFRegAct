@@ -1,0 +1,18 @@
+Purpose: demonstrate optional UMI-adaptive KNN post-processing with exploratory sample-level tests.
+TF: EP300 | Cells: 14627 | Coordinate dimensions: 50 | k: 15
+All scored macrophages retained; no subsampling or value clipping.
+KNN search uses integrated.cca; existing UMAP coordinates are used only for display.
+Neighbours can cross samples/batches; no grouping constraint is applied.
+Raw scores retained; no model refitting and no uncertainty recalculation.
+FeaturePlot panels verified for cell identities, exact score values and common UMAP ranges.
+FeaturePlot has a shared square-root colour scale, without changing scores.
+Boxplot statistics use raw scores; square-root coordinate transform is applied afterwards.
+All four box median/quartile summaries verified against the raw numeric values.
+All cells contribute to boxes and outlier points; diamond markers show sample means.
+Two-sided unpaired Welch t-tests use orig.ident mean activity: 3 Normal and 7 AAA sample IDs.
+Nominal p-values are displayed without multiple-testing correction; both tests are exploratory.
+Smoothed scores borrow across samples; smoothed sample means are not strictly independent.
+Full t statistics, Welch degrees of freedom, mean differences and 95% confidence intervals exported.
+Both figure titles centered; subtitles and bottom captions removed.
+R-only rendering; 600-dpi PNG and editable vector PDF/SVG.
+README code blocks were executed directly to generate these panels.

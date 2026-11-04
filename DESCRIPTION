@@ -20,6 +20,7 @@ Imports:
     igraph,
     Matrix,
     methods,
+    RANN,
     Rcpp,
     SeuratObject,
     stats,
@@ -27,7 +28,11 @@ Imports:
     utils
 Suggests:
     dagitty,
+    ggplot2 (>= 4.0.0),
     loo,
-    pheatmap
+    patchwork,
+    pheatmap,
+    Seurat,
+    svglite
 LinkingTo:
     Rcpp

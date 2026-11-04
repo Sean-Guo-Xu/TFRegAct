@@ -77,3 +77,70 @@
   }
   normalizePath(output, winslash = "/", mustWork = TRUE)
 }
+
+# Activity inference needs coefficient draws, not cell-length Stan output arrays.
+# Keep the same predictor calculation as a model-local variable so neither
+# log_mu nor log_lik is written for every posterior draw.
+.tfregact_activity_compact_stan <- function(stan_file) {
+  stripped <- .tfregact_stan_without_log_lik(stan_file)
+  lines <- readLines(stripped, warn = FALSE)
+  model_line <- which(trimws(lines) == "model {")
+  declaration <- which(trimws(lines) == "vector[N] log_mu;")
+  calculation <- grep("^  log_mu =", lines)
+  if (length(model_line) != 1L || length(declaration) != 1L ||
+      length(calculation) != 1L || calculation >= model_line) {
+    stop("Unexpected activity Stan predictor layout.", call. = FALSE)
+  }
+  closing <- max(which(trimws(lines[seq_len(model_line - 1L)]) == "}"))
+  predictor_lines <- lines[calculation:(closing - 1L)]
+  compact <- lines[-c(declaration, calculation:(closing - 1L))]
+  model_line <- which(trimws(compact) == "model {")
+  compact <- append(compact, c("  vector[N] log_mu;", predictor_lines),
+                    after = model_line)
+  output <- sub("_no_log_lik[.]stan$", "_activity_compact.stan", stripped)
+  if (identical(output, stripped)) {
+    stop("Activity Stan output requires a generated-quantities block.", call. = FALSE)
+  }
+  if (!file.exists(output) || !identical(readLines(output, warn = FALSE), compact)) {
+    writeLines(compact, output, useBytes = TRUE)
+  }
+  normalizePath(output, winslash = "/", mustWork = TRUE)
+}
+
+# CmdStanR 0.8 reads CSVs through external grep on Windows. MSYS startup can
+# fail intermittently in parallel workers. Use the same CSV reader/parser,
+# feeding it R-filtered text instead of a shell command, in this worker only.
+.tfregact_native_cmdstan_csv <- function() {
+  if (.Platform$OS.type != "windows" ||
+      isTRUE(getOption("TFRegAct.native_csv_active"))) return(invisible(FALSE))
+  ns <- asNamespace("cmdstanr")
+  bridge <- new.env(parent = ns)
+  bridge$.tf_native_draws <- function(file, ...) {
+    lines <- readLines(file, warn = FALSE)
+    data.table::fread(text = paste(lines[!startsWith(lines, "#")], collapse = "\n"), ...)
+  }
+  bridge$.tf_native_metadata <- function(file, ...) {
+    lines <- readLines(file, warn = FALSE)
+    data.table::fread(text = paste(lines[grepl("^[#a-zA-Z]", lines)], collapse = "\n"), ...)
+  }
+  replacements <- list(
+    read_cmdstan_csv = ".tf_native_draws(output_file,",
+    read_csv_metadata = ".tf_native_metadata(csv_file,"
+  )
+  patched <- list()
+  for (name in names(replacements)) {
+    fun <- get(name, envir = ns)
+    code <- paste(deparse(body(fun)), collapse = "\n")
+    pattern <- "data.table::fread(cmd = fread_cmd,"
+    if (!grepl(pattern, code, fixed = TRUE)) return(invisible(FALSE))
+    code <- gsub(pattern, replacements[[name]], code, fixed = TRUE)
+    body(fun) <- parse(text = code)[[1L]]
+    environment(fun) <- bridge
+    patched[[name]] <- fun
+  }
+  for (name in names(patched)) {
+    utils::assignInNamespace(name, patched[[name]], ns = "cmdstanr")
+  }
+  options(TFRegAct.native_csv_active = TRUE)
+  invisible(TRUE)
+}

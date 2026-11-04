@@ -198,8 +198,8 @@ expression is zero, the prior probability that the TF is active is controlled
 by `active_prior_zero` (default `0.2`); when expression is detected, this prior
 probability is fixed at `0.9`. Downstream target-gene evidence then updates the
 cell-specific activity probability. Thus, zero expression strongly downweights
-activity but does not force activity to zero, and no cell-neighbour smoothing
-or expression imputation is applied.
+activity but does not force activity to zero. The inference workflow returns
+unsmoothed activity; optional score smoothing is described below.
 
 ```r
 activity_input <- create_TF_computation_input(
@@ -414,5 +414,241 @@ activity_fit <- TF_activity_computation(
 )
 ```
 
-Formal help pages and extended result-interpretation examples will be added as
-the package interface stabilizes.
+## Optional smoothing after activity inference
+
+`smooth_TF_activity()` applies UMI-adaptive KNN smoothing to scores that have
+already been inferred. It keeps a UMI-dependent fraction of each cell's own
+score and borrows the remaining fraction from neighbours, weighted by inverse
+Euclidean distance. The default is `k = 15`. Calling this function is optional:
+the original activity scores and inference results remain available.
+
+### Extract integrated.cca coordinates and smooth the scores
+
+The example continues from `activity_fit` returned by the activity workflow.
+The Seurat object must already contain `integrated.cca` and `umap` reductions,
+the inferred `<TF>_activity_A` column, and `nCount_RNA`, `batch`, `sample`, and
+`orig.ident` metadata. Here, `sample` contains the condition labels `Normal` and
+`AAA`, and `orig.ident` identifies the biological samples.
+Extract the full integrated.cca embedding for neighbour search; UMAP is used
+only to display the result.
+
+<!-- smoothing-example:start -->
+```r
+library(TFRegAct)
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+
+activity_seurat <- activity_fit$seurat_object
+tf <- activity_fit$target_tf
+cells <- colnames(activity_seurat)
+raw_column <- paste0(tf, "_activity_A")
+smooth_column <- paste0(tf, "_activity_A_smooth")
+
+coordinate <- Embeddings(activity_seurat, reduction = "integrated.cca")
+raw_score <- setNames(activity_seurat[[raw_column]][, 1], cells)
+umi <- setNames(activity_seurat$nCount_RNA, cells)
+batch <- setNames(activity_seurat$batch, cells)
+
+smooth_score <- smooth_TF_activity(
+  score = raw_score,
+  coordinate = coordinate,
+  umi = umi,
+  batch = batch,
+  k = 15
+)
+activity_seurat[[smooth_column]] <- smooth_score[cells]
+```
+
+Coordinates require cell row names and dimension names identifying the
+reduction, such as `integratedcca_1`, `integratedcca_2`, etc.; the Seurat key
+`integrateddr_` is also supported. Cell names are matched automatically.
+Missing cells, duplicate identifiers, non-finite values, incompatible coordinate
+labels, and invalid `k` raise errors.
+
+For data without batch labels, pass externally computed UMAP coordinates with
+`coordinate = Embeddings(activity_seurat, "umap")` and `batch = NULL`.
+Batch labels select the expected coordinate type; they do not restrict neighbours
+to the same batch or sample. The example searches across all supplied cells in
+the selected population. To restrict smoothing within individual samples, call
+the function separately on each sample's cells.
+
+### FeaturePlot: original versus smoothed activity
+
+Both panels show the same cells at their existing UMAP positions. A common
+square-root colour scale makes low and intermediate activity easier to see;
+this changes the colour mapping, not the score values. No cells or high values
+are removed.
+
+```r
+activity_limits <- c(0, max(c(raw_score, smooth_score)))
+feature_panels <- FeaturePlot(
+  activity_seurat,
+  features = c(raw_column, smooth_column),
+  reduction = "umap",
+  keep.scale = "all",
+  order = TRUE,
+  pt.size = 0.25,
+  raster = FALSE,
+  combine = FALSE
+)
+panel_titles <- c("Original activity", "KNN-smoothed activity")
+for (i in seq_along(feature_panels)) {
+  feature_panels[[i]] <- suppressMessages(
+    feature_panels[[i]] +
+      scale_colour_gradientn(
+        colours = c("#DDDDDD", "#F4A582", "#B2182B"),
+        limits = activity_limits, trans = "sqrt", name = "Activity"
+      ) +
+      labs(title = panel_titles[i], x = "UMAP 1", y = "UMAP 2") +
+      theme_classic(base_size = 11, base_family = "sans") +
+      theme(plot.title = element_text(hjust = 0.5))
+  )
+}
+p_feature <- wrap_plots(feature_panels, ncol = 2, guides = "collect") +
+  plot_annotation(
+    title = paste(tf, "activity: original versus KNN-smoothed"),
+    theme = theme(plot.title = element_text(face = "bold", hjust = 0.5))
+  )
+p_feature
+```
+
+![Original and smoothed EP300 activity on UMAP](docs/figures/smoothing-featureplot.png)
+
+### Boxplot: activity distributions and sample-level t-tests
+
+Boxes use the median and interquartile range of all cells in each condition;
+whiskers extend to the most extreme observations within 1.5 times the IQR.
+Outlying cells are shown as points. The square-root display axis is applied
+after box statistics are calculated from the original score values.
+For the condition comparison, average activity within each `orig.ident` first,
+then use a two-sided, unpaired Welch t-test on these sample means (3 Normal and
+7 AAA sample IDs in this example). The boxes describe cell-level distributions;
+black diamonds mark sample means used by the tests. The two displayed p-values
+are nominal, without multiple-testing correction, for this exploratory comparison
+before and after smoothing.
+
+```r
+condition <- factor(activity_seurat$sample, levels = c("Normal", "AAA"))
+box_data <- rbind(
+  data.frame(cell = cells, orig.ident = activity_seurat$orig.ident, condition = condition,
+             method = "Original", activity = as.numeric(raw_score[cells])),
+  data.frame(cell = cells, orig.ident = activity_seurat$orig.ident, condition = condition,
+             method = "KNN-smoothed", activity = as.numeric(smooth_score[cells]))
+)
+box_data$method <- factor(box_data$method, levels = c("Original", "KNN-smoothed"))
+sample_means <- aggregate(activity ~ orig.ident + condition + method,
+                          data = box_data, FUN = mean)
+ttest_results <- do.call(rbind, lapply(levels(box_data$method), function(m) {
+  d <- sample_means[sample_means$method == m, ]
+  normal <- d$activity[d$condition == "Normal"]
+  aaa <- d$activity[d$condition == "AAA"]
+  test <- t.test(aaa, normal, alternative = "two.sided", var.equal = FALSE)
+  data.frame(method = m, n_Normal = length(normal), n_AAA = length(aaa),
+             mean_Normal = mean(normal), mean_AAA = mean(aaa),
+             difference_AAA_minus_Normal = mean(aaa) - mean(normal),
+             t = unname(test$statistic), df = unname(test$parameter),
+             p = test$p.value, ci_low = test$conf.int[1], ci_high = test$conf.int[2])
+}))
+ttest_results$method <- factor(ttest_results$method, levels = levels(box_data$method))
+ttest_results$label <- paste0("Welch t-test: p = ", formatC(ttest_results$p, digits = 3, format = "f"))
+bracket_y <- activity_limits[2] * 1.06
+ttest_results$bracket_y <- bracket_y
+p_box <- ggplot(box_data, aes(condition, activity, fill = condition)) +
+  geom_boxplot(width = 0.5, outlier.size = 0.25, outlier.alpha = 0.15,
+               linewidth = 0.35) +
+  geom_point(data = sample_means, shape = 23, fill = "white", size = 1.8,
+             position = position_jitter(width = 0.07, height = 0, seed = 42)) +
+  geom_segment(data = ttest_results, inherit.aes = FALSE,
+               aes(x = 1, xend = 2, y = bracket_y, yend = bracket_y), linewidth = 0.35) +
+  geom_segment(data = ttest_results, inherit.aes = FALSE,
+               aes(x = 1, xend = 1, y = bracket_y, yend = bracket_y * 0.96), linewidth = 0.35) +
+  geom_segment(data = ttest_results, inherit.aes = FALSE,
+               aes(x = 2, xend = 2, y = bracket_y, yend = bracket_y * 0.96), linewidth = 0.35) +
+  geom_text(data = ttest_results, inherit.aes = FALSE,
+            aes(x = 1.5, y = bracket_y * 1.09, label = label), size = 3.4) +
+  facet_wrap(~ method, nrow = 1) +
+  scale_fill_manual(values = c(Normal = "#4D8299", AAA = "#C47F62")) +
+  scale_y_continuous(limits = c(0, bracket_y * 1.2), expand = expansion(mult = c(0, 0.02))) +
+  coord_transform(y = "sqrt") +
+  labs(
+    title = paste(tf, "activity distributions before and after smoothing"),
+    x = NULL, y = "Inferred activity"
+  ) +
+  theme_classic(base_size = 11, base_family = "sans") +
+  theme(legend.position = "none", strip.background = element_blank(),
+        plot.title = element_text(face = "bold", hjust = 0.5))
+p_box
+```
+<!-- smoothing-example:end -->
+
+![Original and smoothed EP300 activity distributions](docs/figures/smoothing-boxplot.png)
+
+The rendered example uses all **14,627 macrophages** (Normal: 6,085; AAA: 8,542)
+from 10 sample IDs and two batches. EP300 activity was inferred using 22 retained
+high-confidence target genes (target confidence at least 7) and
+`nuisance_draw_count = 0`. Smoothing uses all 50 integrated.cca dimensions and
+does not refit the activity model. The code above also works for other TFs in
+`activity_fit`.
+
+Cell-weighted summaries for this rendered example are:
+
+| Condition | Original mean | Smoothed mean | Original median | Smoothed median |
+|---|---:|---:|---:|---:|
+| Normal | 0.2459 | 0.2647 | 0.0886 | 0.1830 |
+| AAA | 0.2994 | 0.2940 | 0.0894 | 0.1976 |
+
+### EP300: exploratory cell-level comparison
+
+The following panel compares the same original and smoothed EP300 activity
+scores using individual cells as the analysis unit: 6,085 Normal and 8,542 AAA
+macrophages. Two-sided, unpaired Welch t-tests are calculated from the
+untransformed scores. Boxes and whiskers use the same definitions as above;
+the square-root axis changes only the display. Both p-values are nominal,
+without multiple-testing correction.
+
+```r
+cell_ttests <- do.call(rbind, lapply(levels(box_data$method), function(m) {
+  d <- box_data[box_data$method == m, ]
+  normal <- d$activity[d$condition == "Normal"]
+  aaa <- d$activity[d$condition == "AAA"]
+  test <- t.test(aaa, normal, alternative = "two.sided", var.equal = FALSE)
+  data.frame(method = m, n_Normal = length(normal), n_AAA = length(aaa),
+             mean_Normal = mean(normal), mean_AAA = mean(aaa), p = test$p.value)
+}))
+cell_ttests
+```
+
+![EP300 original and smoothed activity with exploratory cell-level t-tests](docs/figures/ep300-cell-level-boxplot.png)
+
+| Activity scores | Normal mean | AAA mean | Cell-level p | Sample-level p |
+|---|---:|---:|---:|---:|
+| Original | 0.2459 | 0.2994 | 4.85e-12 | 0.670 |
+| KNN-smoothed | 0.2647 | 0.2940 | 4.26e-13 | 0.757 |
+
+The sample-level column uses the 3 Normal and 7 AAA sample means shown in the
+preceding panel. These analyses weight observations differently: cell-level
+means weight samples by their cell counts, whereas the sample-level comparison
+gives each sample equal weight. Cells within a sample are correlated, and pooled
+KNN smoothing adds dependence. The cell-level p-values therefore provide an
+exploratory comparison and do not establish a between-sample condition effect.
+
+The [complete test results](docs/figures/ep300-cell-level-ttests.csv) include
+Welch statistics, degrees of freedom, mean differences and 95% confidence
+intervals under the independent-cell assumption. To reproduce this panel from
+the saved [figure source data](docs/figures/smoothing-source-data.csv), run
+`Rscript dev/generate_ep300_cell_comparison.R` from the package root. The script
+exports PNG, PDF and SVG panels without refitting the activity model.
+
+Smoothed scores are deterministic post-processed values; the original posterior
+uncertainty does not transfer to them. Smoothing can change sample and condition
+means, so inspect the original and smoothed results together. Cells are not
+independent biological replicates for condition tests. Here, neighbours may
+cross sample boundaries, so the t-test on smoothed sample means is exploratory:
+smoothing itself introduces dependence between samples. For a sample-independent
+smoothing analysis, smooth each sample separately before comparing its mean score.
+
+The figure-generation script is [dev/generate_smoothing_example.R](dev/generate_smoothing_example.R).
+It executes the README code on externally supplied Seurat data and previously
+exported activity results. Figure source data and summary tables are saved with
+the rendered panels under `docs/figures/`.

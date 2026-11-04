@@ -958,11 +958,7 @@ run_TF_stage1_screening_regressions <- function(
 
   if (length(pending_genes)) {
     # Compile exactly once in the main R process before starting workers.
-    worker_stan_file <- if (identical(prior_family, "normal")) {
-      .tfregact_stan_without_log_lik(stan_file)
-    } else {
-      stan_file
-    }
+    worker_stan_file <- .tfregact_activity_compact_stan(stan_file)
     compiled_model <- cmdstanr::cmdstan_model(
       stan_file = worker_stan_file,
       force_recompile = isTRUE(force_recompile)
@@ -977,6 +973,7 @@ run_TF_stage1_screening_regressions <- function(
       varlist = c(
         "worker_stan_file",
         "worker_exe_file",
+        ".tfregact_native_cmdstan_csv",
         "tf_stage1_screening_stop",
         "tf_validate_shared_laplace_stage1_data",
         "tf_fit_shared_laplace_stage1",
@@ -990,6 +987,7 @@ run_TF_stage1_screening_regressions <- function(
       envir = environment()
     )
     parallel::clusterEvalQ(cluster, {
+      .tfregact_native_cmdstan_csv()
       .tf_stage1_worker_model <- cmdstanr::cmdstan_model(
         stan_file = worker_stan_file,
         exe_file = worker_exe_file,
@@ -998,9 +996,16 @@ run_TF_stage1_screening_regressions <- function(
       NULL
     })
 
+    # Feed multiple waves of MCMC jobs to load balancing. One-wave batches
+    # leave workers idle whenever a single gene needs a slower NUTS fit.
+    model_batch_size <- if (identical(inference, "mcmc")) {
+      worker_count * 8L
+    } else {
+      worker_count
+    }
     batches <- split(
       pending_genes,
-      ceiling(seq_along(pending_genes) / worker_count)
+      ceiling(seq_along(pending_genes) / model_batch_size)
     )
     checkpoint_targets <- if (checkpoint_count > 0L) {
       unique(as.integer(ceiling(
@@ -1029,14 +1034,16 @@ run_TF_stage1_screening_regressions <- function(
         cluster,
         jobs,
         tf_stage1_screening_fit_one,
-        sampling = sampling
+        sampling = sampling,
+        chunk.size = 1L
       )
       names(batch_results) <- genes
       results[genes] <- batch_results
       completed_count <- sum(!vapply(results, is.null, logical(1)))
       crossed_target <- checkpoint_targets > last_checkpoint_completed &
         checkpoint_targets <= completed_count
-      if (any(crossed_target)) {
+      if (any(crossed_target) ||
+          (identical(inference, "mcmc") && checkpoint_count > 0L)) {
         checkpoint <- results[!vapply(results, is.null, logical(1))]
         checkpoint <- stamp_result(checkpoint, complete = FALSE)
         saveRDS(checkpoint, checkpoint_file)
