@@ -1,7 +1,7 @@
 Package: TFRegAct
 Type: Package
 Title: Bayesian Transcription Factor Regulation and Activity Inference
-Version: 0.0.0.9000
+Version: 0.0.0.9003
 Depends:
     R (>= 4.1.0)
 Authors@R: 

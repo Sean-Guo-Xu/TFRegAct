@@ -6,7 +6,7 @@
 // No intercept or sample dummy columns in W. With condition present, include
 // its main effect in W; the separate condition input defines slope groups.
 // Suggested starting scales (caller must supply; Stan has no data defaults):
-// sample_*_sd_scale=1; beta priors are constructed by the shared Stage 2 helper.
+// sample_*_sd_scale=1; beta priors reuse the original Stage 1 knowledge prior.
 data {
   int<lower=1> N;
   int<lower=1> P;
@@ -22,8 +22,11 @@ data {
   int<lower=0> Q;
   matrix[N, Q] W;
   vector<lower=0>[Q] W_prior_scale;
-  vector[P] beta_prior_mean;
-  vector<lower=0>[P] beta_prior_sd;
+  vector<lower=0>[P] confidence;
+  array[P] int<lower=-1, upper=1> direction;
+  real<lower=0> gamma;
+  real<lower=0> eta;
+  real<lower=1> r_dir;
   real<lower=0> alpha_prior_sd;
   real<lower=0> target_interaction_sd;
   real<lower=0> sample_intercept_sd_scale;
@@ -113,8 +116,17 @@ model {
   if (Q > 0) zeta ~ normal(rep_vector(0, Q), W_prior_scale);
   if (use_target_interaction == 1)
     beta_target_delta_free[1] ~ normal(0, target_interaction_sd);
-  // Stage 1 posterior-informed Normal priors on the same predictor scale.
-  beta ~ normal(beta_prior_mean, beta_prior_sd);
+  // Same knowledge prior as Stage 1, on the unchanged predictor scale.
+  for (j in 1:P) {
+    real b_j = pow(fmax(confidence[j], 1.0) / 10.0, eta) * gamma;
+    real lambda_fav = 1.0 / b_j;
+    real lambda_opp = direction[j] == 0 ? lambda_fav : r_dir * lambda_fav;
+    real lambda_pos = direction[j] == -1 ? lambda_opp : lambda_fav;
+    real lambda_neg = direction[j] == 1 ? lambda_opp : lambda_fav;
+    target += log(lambda_pos) + log(lambda_neg) - log(lambda_pos + lambda_neg);
+    if (beta[j] >= 0) target += -lambda_pos * beta[j];
+    else target += lambda_neg * beta[j];
+  }
   Y ~ neg_binomial_2_log(log_mu, phi);
 }
 generated quantities {

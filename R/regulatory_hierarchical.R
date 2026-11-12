@@ -52,7 +52,7 @@ tf_hierarchical_sample_design <- function(stan_data, metadata, sample_column) {
 
 run_TF_stage2_hierarchical_model <- function(
   analysis_object, stage1_fit_result, metadata, sample_column,
-  direction_effect = 0.2, beta_sd_floor = 0.5, stage1_sd_multiplier = 1.5,
+  direction_effect = NULL, beta_sd_floor = NULL, stage1_sd_multiplier = NULL,
   control_level = NULL, disease_level = NULL, confidence_min = 1, confidence_max = 10,
   nuisance_prior_scale = 1, target_interaction_sd = 0.5,
   sample_intercept_sd_scale = 1, sample_slope_sd_scale = 1,
@@ -80,7 +80,7 @@ run_TF_stage2_hierarchical_model <- function(
   d$save_log_lik <- as.integer(compute_loo)
   fields <- c("N", "P", "Y", "X", "log_offset", "S", "sample_id",
     "has_condition", "sample_condition", "use_target_interaction", "target_tf_index",
-    "Q", "W", "W_prior_scale", "beta_prior_mean", "beta_prior_sd", "alpha_prior_sd",
+    "Q", "W", "W_prior_scale", "confidence", "direction", "gamma", "eta", "r_dir", "alpha_prior_sd",
     "target_interaction_sd", "sample_intercept_sd_scale", "sample_slope_sd_scale", "save_log_lik")
   stan_file <- .tfregact_stan_file("TF_stage2_hierarchical_nb_model.stan")
   model <- tf_get_cmdstan_model(stan_file, force_recompile, include_log_lik = TRUE)

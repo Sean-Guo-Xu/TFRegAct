@@ -7,6 +7,7 @@ tf_assert_target_interaction_dependencies <- function() {
     required_functions,
     exists,
     logical(1),
+    envir = environment(tf_assert_target_interaction_dependencies),
     mode = "function",
     inherits = TRUE
   )]
@@ -38,9 +39,9 @@ run_TF_stage2_target_interaction_model <- function(
   analysis_object,
   stage1_fit_result,
   stan_file,
-  direction_effect,
-  beta_sd_floor,
-  stage1_sd_multiplier,
+  direction_effect = NULL,
+  beta_sd_floor = NULL,
+  stage1_sd_multiplier = NULL,
   target_interaction_sd,
   control_level,
   disease_level,

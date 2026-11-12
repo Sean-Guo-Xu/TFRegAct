@@ -1,5 +1,7 @@
-Smoothed EP300 activity only; all 14627 cells retained.
-Basic README ggplot2 boxplot with median/IQR boxes and 1.5-IQR whiskers; no score clipping.
-Two-sided Welch t-test on untransformed cell scores: p=4.25923204079529e-13.
-Cell-level p-values are exploratory because cells within samples and smoothed scores are dependent.
-Linear axes; centered title; no subtitle or caption; R PNG/PDF/SVG export.
+Each panel uses the same 14,627 macrophages (6,085 Normal and 8,542 AAA) from smoothing-source-data.csv.
+Before and after smoothing share one linear y-axis and the same Normal/AAA colours.
+Boxes show median and IQR, with 1.5-IQR whiskers and outlier points. Quartiles match the source scores for both groups in both panels.
+Two-sided Welch tests on the untransformed cell scores match ep300-cell-level-ttests.csv.
+Before smoothing p = 4.8484201160684e-12. After smoothing p = 4.25923204079529e-13.
+These cell-level p-values are exploratory because cells within a sample and smoothed scores are correlated.
+Exported with R at 8 x 4.6 in as a 600 dpi PNG and editable PDF and SVG.

@@ -56,22 +56,30 @@ tf_em_validate_input <- function(stage2_input) {
     stage2_input <- readRDS(stage2_input)
   }
   if (!is.list(stage2_input) ||
-      !identical(stage2_input$interface_version, "tf_em_stage2_input_v3")) {
-    tf_em_stop("`stage2_input` must use interface `tf_em_stage2_input_v3`.")
+      !identical(stage2_input$interface_version, "tf_em_stage2_input_v4")) {
+    tf_em_stop("`stage2_input` must use interface `tf_em_stage2_input_v4`.")
   }
   required <- c(
     "N", "G", "S", "Y", "eta0_draws", "phi_draws", "has_condition", "condition",
     "target_tf_expression", "target_tf_center", "target_tf_scale",
-    "beta_target_mean_init", "beta_target_delta_init", "beta_prior_mean",
-    "beta_prior_sd", "target_interaction_sd", "cell_names", "target_genes"
+    "beta_target_mean_init", "beta_target_delta_init", "beta_prior_family",
+    "beta_lambda_positive", "beta_lambda_negative", "target_interaction_sd",
+    "cell_names", "target_genes"
   )
   missing <- setdiff(required, names(stage2_input))
   if (length(missing)) {
     tf_em_stop("EM Stage2 input is missing: %s.", paste(missing, collapse = ", "))
   }
+  if (!identical(stage2_input$beta_prior_family, "laplace")) {
+    tf_em_stop("EM requires the Stage2 knowledge-based asymmetric Laplace beta prior.")
+  }
   N <- as.integer(stage2_input$N)
   G <- as.integer(stage2_input$G)
   S <- as.integer(stage2_input$S)
+  if (length(N) != 1L || length(G) != 1L || length(S) != 1L ||
+      anyNA(c(N, G, S)) || any(c(N, G, S) < 1L)) {
+    tf_em_stop("N, G and S must be positive integer dimensions.")
+  }
   if (!identical(dim(stage2_input$Y), c(N, G)) ||
       !identical(dim(stage2_input$eta0_draws), c(S, N, G)) ||
       !identical(dim(stage2_input$phi_draws), c(S, G))) {
@@ -98,8 +106,8 @@ tf_em_validate_input <- function(stage2_input) {
     tf_em_stop("Y, eta0_draws, and phi_draws contain invalid values.")
   }
   gene_vectors <- c(
-    "beta_target_mean_init", "beta_target_delta_init", "beta_prior_mean",
-    "beta_prior_sd", "target_interaction_sd"
+    "beta_target_mean_init", "beta_target_delta_init", "beta_lambda_positive",
+    "beta_lambda_negative", "target_interaction_sd"
   )
   for (field in gene_vectors) {
     value <- stage2_input[[field]]
@@ -107,9 +115,10 @@ tf_em_validate_input <- function(stage2_input) {
       tf_em_stop("`%s` must contain one finite value per target gene.", field)
     }
   }
-  if (any(stage2_input$beta_prior_sd <= 0) ||
+  if (any(stage2_input$beta_lambda_positive <= 0) ||
+      any(stage2_input$beta_lambda_negative <= 0) ||
       any(stage2_input$target_interaction_sd <= 0)) {
-    tf_em_stop("Beta prior scales must be positive.")
+    tf_em_stop("Beta prior rates and interaction scales must be positive.")
   }
   if (length(stage2_input$cell_names) != N ||
       length(stage2_input$target_genes) != G ||
@@ -410,7 +419,8 @@ tf_em_gene_expected_log_posterior <- function(
   eta0_gene,
   phi_gene,
   estep,
-  return_information = FALSE
+  return_information = FALSE,
+  beta_branch = NULL
 ) {
   beta_by_cell <- parameters[[1]] +
     common$condition_shift * parameters[[2]]
@@ -422,12 +432,22 @@ tf_em_gene_expected_log_posterior <- function(
   log_likelihood <- sweep(eta, 1L, y_gene, FUN = "*") -
     sweep(log_denominator, 1L, y_gene + phi_gene, FUN = "*")
   expected_log_likelihood <- sum(estep$weights * log_likelihood)
-  log_prior <- -0.5 * (
-    (parameters[[1]] - common$beta_prior_mean[[gene_index]]) /
-      common$beta_prior_sd[[gene_index]]
-  ) ^ 2 - 0.5 * (
+  lambda_positive <- common$beta_lambda_positive[[gene_index]]
+  lambda_negative <- common$beta_lambda_negative[[gene_index]]
+  log_prior <- if (parameters[[1]] >= 0) {
+    -lambda_positive * parameters[[1]]
+  } else {
+    lambda_negative * parameters[[1]]
+  }
+  log_prior <- log_prior - 0.5 * (
     parameters[[2]] / common$target_interaction_sd[[gene_index]]
   ) ^ 2
+  # At zero the prior has two one-sided derivatives. The constrained optimizer
+  # supplies its branch explicitly; there is no smooth derivative at the kink.
+  positive_branch <- if (is.null(beta_branch)) parameters[[1]] >= 0 else {
+    match.arg(beta_branch, c("positive", "negative")) == "positive"
+  }
+  prior_gradient <- if (positive_branch) -lambda_positive else lambda_negative
 
   probability_mu <- stats::plogis(eta - log(phi_gene))
   score_eta <- sweep(
@@ -440,9 +460,7 @@ tf_em_gene_expected_log_posterior <- function(
   common_gradient <- estep$weights * score_eta * activity_std
   condition_shift <- common$condition_shift
   gradient <- c(
-    sum(common_gradient) -
-      (parameters[[1]] - common$beta_prior_mean[[gene_index]]) /
-        common$beta_prior_sd[[gene_index]] ^ 2,
+    sum(common_gradient) + prior_gradient,
     sum(sweep(common_gradient, 1L, condition_shift, FUN = "*")) -
       parameters[[2]] / common$target_interaction_sd[[gene_index]] ^ 2
   )
@@ -455,13 +473,14 @@ tf_em_gene_expected_log_posterior <- function(
       sweep(probability_mu * (1 - probability_mu), 1L,
             y_gene + phi_gene, FUN = "*") * activity_std ^ 2
     information <- matrix(c(
-      sum(curvature) + 1 / common$beta_prior_sd[[gene_index]] ^ 2,
+      sum(curvature),
       sum(sweep(curvature, 1L, condition_shift, FUN = "*")),
       sum(sweep(curvature, 1L, condition_shift, FUN = "*")),
       sum(sweep(curvature, 1L, condition_shift ^ 2, FUN = "*")) +
         1 / common$target_interaction_sd[[gene_index]] ^ 2
     ), 2L, 2L)
     result$information <- information
+    result$at_prior_kink <- parameters[[1]] == 0
   }
   result
 }
@@ -472,64 +491,67 @@ tf_em_mstep <- function(common, eta0, phi, estep, beta_mean, beta_delta, setting
   covariance <- array(NA_real_, dim = c(2L, 2L, G))
   convergence <- integer(G)
   objective <- numeric(G)
+  at_prior_kink <- logical(G)
+  branch_convergence <- matrix(NA_integer_, G, 2L,
+    dimnames = list(common$target_genes, c("positive", "negative")))
   for (g in seq_len(G)) {
-    if (common$has_condition) {
+    branch_fits <- lapply(c("positive", "negative"), function(branch) {
+      positive <- branch == "positive"
+      start_beta <- if (positive) max(beta_mean[[g]], 0) else min(beta_mean[[g]], 0)
+      start <- if (common$has_condition) c(start_beta, beta_delta[[g]]) else start_beta
+      unpack <- function(parameters) {
+        if (common$has_condition) parameters else c(parameters[[1]], 0)
+      }
       objective_function <- function(parameters) {
         -tf_em_gene_expected_log_posterior(
-          parameters, g, common, eta0[, g], phi[[g]], estep
+          unpack(parameters), g, common, eta0[, g], phi[[g]], estep,
+          beta_branch = branch
         )$value
       }
       gradient_function <- function(parameters) {
-        -tf_em_gene_expected_log_posterior(
-          parameters, g, common, eta0[, g], phi[[g]], estep
+        gradient <- tf_em_gene_expected_log_posterior(
+          unpack(parameters), g, common, eta0[, g], phi[[g]], estep,
+          beta_branch = branch
         )$gradient
+        -gradient[seq_along(parameters)]
       }
-      fit <- stats::optim(
-        par = c(beta_mean[[g]], beta_delta[[g]]),
+      stats::optim(
+        par = start,
         fn = objective_function,
         gr = gradient_function,
-        method = "BFGS",
+        method = "L-BFGS-B",
+        lower = c(if (positive) 0 else -Inf, if (common$has_condition) -Inf),
+        upper = c(if (positive) Inf else 0, if (common$has_condition) Inf),
         control = list(
           maxit = settings$mstep_maxit,
-          reltol = settings$mstep_reltol
+          factr = max(1, settings$mstep_reltol / .Machine$double.eps),
+          pgtol = settings$mstep_reltol
         )
       )
-      fitted_parameters <- fit$par
-    } else {
-      objective_function <- function(beta) {
-        -tf_em_gene_expected_log_posterior(
-          c(beta[[1]], 0), g, common, eta0[, g], phi[[g]], estep
-        )$value
-      }
-      gradient_function <- function(beta) {
-        -tf_em_gene_expected_log_posterior(
-          c(beta[[1]], 0), g, common, eta0[, g], phi[[g]], estep
-        )$gradient[[1]]
-      }
-      fit <- stats::optim(
-        par = beta_mean[[g]],
-        fn = objective_function,
-        gr = gradient_function,
-        method = "BFGS",
-        control = list(
-          maxit = settings$mstep_maxit,
-          reltol = settings$mstep_reltol
-        )
-      )
-      fitted_parameters <- c(fit$par[[1]], 0)
-    }
+    })
+    branch_convergence[g, ] <- vapply(branch_fits, `[[`, integer(1), "convergence")
+    # The expected NB log likelihood is concave in (beta, delta), and each
+    # Laplace half-axis is smooth. Comparing both constrained solutions includes
+    # the kink and avoids pretending that the full prior is differentiable.
+    fit <- branch_fits[[which.min(vapply(branch_fits, `[[`, numeric(1), "value"))]]
+    fitted_parameters <- if (common$has_condition) fit$par else c(fit$par[[1]], 0)
     if (any(!is.finite(fit$par)) || !is.finite(fit$value)) {
       tf_em_stop("Non-finite M-step result for gene `%s`.", common$target_genes[[g]])
     }
     updated_mean[[g]] <- fitted_parameters[[1]]
     updated_delta[[g]] <- fitted_parameters[[2]]
+    at_prior_kink[[g]] <- fitted_parameters[[1]] == 0
     convergence[[g]] <- fit$convergence
     objective[[g]] <- -fit$value
     information <- tf_em_gene_expected_log_posterior(
       fitted_parameters, g, common, eta0[, g], phi[[g]], estep,
       return_information = TRUE
     )$information
-    if (common$has_condition) {
+    if (at_prior_kink[[g]]) {
+      # A Gaussian based on the one-sided curvature cannot represent the cusp.
+      # Leave uncertainty unavailable here; the conditional MAP remains valid.
+      covariance[, , g] <- NA_real_
+    } else if (common$has_condition) {
       covariance[, , g] <- tryCatch(
         solve(information),
         error = function(e) {
@@ -549,13 +571,18 @@ tf_em_mstep <- function(common, eta0, phi, estep, beta_mean, beta_delta, setting
     beta_delta = updated_delta,
     covariance = covariance,
     convergence = convergence,
+    branch_convergence = branch_convergence,
+    at_prior_kink = at_prior_kink,
+    uncertainty_method = ifelse(at_prior_kink, "unavailable_at_prior_kink",
+      "local_complete_data_normal_not_full_posterior"),
     objective = objective
   )
 }
 
 tf_em_beta_log_prior <- function(beta_mean, beta_delta, common) {
-  result <- sum(-0.5 * ((beta_mean - common$beta_prior_mean) /
-                         common$beta_prior_sd) ^ 2)
+  result <- sum(ifelse(beta_mean >= 0,
+    -common$beta_lambda_positive * beta_mean,
+    common$beta_lambda_negative * beta_mean))
   if (common$has_condition) {
     result <- result +
       sum(-0.5 * (beta_delta / common$target_interaction_sd) ^ 2)
@@ -574,7 +601,9 @@ tf_em_scaled_beta_change <- function(
   old_delta,
   common
 ) {
-  changes <- abs(new_mean - old_mean) / common$beta_prior_sd
+  prior_sd <- sqrt(1 / common$beta_lambda_positive ^ 2 +
+                     1 / common$beta_lambda_negative ^ 2)
+  changes <- abs(new_mean - old_mean) / prior_sd
   if (common$has_condition) {
     changes <- c(
       changes,
@@ -600,7 +629,118 @@ tf_em_sample_bivariate_normal <- function(mean, covariance) {
   mean + eig$vectors %*% (sqrt(pmax(eig$values, 0)) * stats::rnorm(2L))
 }
 
+tf_em_sampler_ess <- function(values) {
+  count <- length(values)
+  if (count < 4L || !all(is.finite(values))) return(NA_real_)
+  if (stats::var(values) == 0) return(NA_real_)
+  correlation <- as.numeric(stats::acf(
+    values, lag.max = count - 1L, plot = FALSE, demean = TRUE
+  )$acf)
+  pair_count <- length(correlation) %/% 2L
+  paired <- correlation[seq.int(1L, 2L * pair_count, by = 2L)] +
+    correlation[seq.int(2L, 2L * pair_count, by = 2L)]
+  first_nonpositive <- which(paired <= 0)
+  if (length(first_nonpositive)) paired <- utils::head(paired, first_nonpositive[[1]] - 1L)
+  if (!length(paired)) return(as.numeric(count))
+  autocorrelation_time <- max(1, -1 + 2 * sum(cummin(paired)))
+  min(as.numeric(count), count / autocorrelation_time)
+}
+
+tf_em_gibbs_fit_one_draw <- function(job, common, settings) {
+  started <- Sys.time()
+  tryCatch({
+    set.seed(settings$seed + as.integer(job$draw_id))
+    samples <- tf_activity_gibbs_ars_cpp(common, job$eta0, job$phi, settings)
+    activity <- samples$activity_samples
+    beta <- samples$beta_samples
+    delta <- samples$delta_samples
+    active <- activity > 0
+    active_count <- rowSums(active)
+    activity_quantiles <- t(apply(activity, 1L, stats::quantile,
+      probs = c(0.05, 0.5, 0.95), names = FALSE))
+    coefficient_summary <- function(values) {
+      quantiles <- t(apply(values, 2L, stats::quantile,
+        probs = c(0.05, 0.5, 0.95), names = FALSE))
+      cbind(mean = colMeans(values), sd = apply(values, 2L, stats::sd),
+        q05 = quantiles[, 1L], median = quantiles[, 2L], q95 = quantiles[, 3L])
+    }
+    beta_covariance <- array(0, dim = c(2L, 2L, common$G))
+    for (g in seq_len(common$G)) {
+      beta_covariance[, , g] <- stats::cov(cbind(beta[, g], delta[, g]))
+    }
+    selected <- sample.int(settings$iter_sampling, 1L)
+    beta_ess <- apply(beta, 2L, tf_em_sampler_ess)
+    delta_ess <- if (common$has_condition) apply(delta, 2L, tf_em_sampler_ess) else {
+      rep(NA_real_, common$G)
+    }
+    difference_samples <- if (common$has_condition) {
+      colMeans(activity[common$condition == 1L, , drop = FALSE]) -
+        colMeans(activity[common$condition == 0L, , drop = FALSE])
+    } else numeric(0)
+    list(
+      status = "ok", draw_id = as.integer(job$draw_id), converged = NA,
+      iterations = as.integer(settings$iter_warmup + settings$iter_sampling),
+      beta_mean = colMeans(beta), beta_delta = colMeans(delta),
+      beta_control = colMeans(beta - 0.5 * delta),
+      beta_disease = colMeans(beta + 0.5 * delta),
+      beta_covariance = beta_covariance,
+      beta_at_prior_kink = rep(FALSE, common$G),
+      beta_uncertainty_method = rep("gibbs_ars_empirical_posterior", common$G),
+      mstep_branch_convergence = matrix(NA_integer_, common$G, 2L,
+        dimnames = list(common$target_genes, c("positive", "negative"))),
+      beta_estimation = "posterior_mean",
+      beta_posterior_sample_mean = beta[selected, ],
+      beta_posterior_sample_delta = delta[selected, ],
+      coefficient_posterior_summary = list(
+        beta_mean = coefficient_summary(beta), beta_delta = coefficient_summary(delta),
+        beta_control = coefficient_summary(beta - 0.5 * delta),
+        beta_disease = coefficient_summary(beta + 0.5 * delta)
+      ),
+      activity_mean = rowMeans(activity),
+      activity_variance = apply(activity, 1L, stats::var),
+      activity_q05 = activity_quantiles[, 1L], activity_median = activity_quantiles[, 2L],
+      activity_q95 = activity_quantiles[, 3L], activity_mode = rep(NA_real_, common$N),
+      activity_active_probability = rowMeans(active),
+      activity_given_active_mean = ifelse(active_count > 0L,
+        rowSums(activity) / pmax(active_count, 1L), NA_real_),
+      activity_active_draw_count = active_count,
+      activity_posterior_sample = activity[, selected],
+      activity_condition_difference_samples = difference_samples,
+      final_observed_objective = NA_real_,
+      final_joint_log_kernel = utils::tail(samples$log_joint_trace, 1L),
+      monotonicity_violations = NA_integer_, max_upper_expansions = NA_integer_,
+      min_tail_log_drop = NA_real_,
+      sampling_diagnostics = list(
+        chains = 1L, rhat = NA_real_,
+        convergence_assessment = "One chain per conditional nuisance target; convergence not established",
+        ess_method = "Geyer initial positive monotone sequence for retained scalar draws",
+        beta_ess = stats::setNames(beta_ess, common$target_genes),
+        delta_ess = stats::setNames(delta_ess, common$target_genes),
+        mean_activity_ess = tf_em_sampler_ess(samples$activity_mean_trace),
+        active_count_ess = tf_em_sampler_ess(samples$active_count_trace),
+        ars_proposals = samples$ars_proposals, ars_rejections = samples$ars_rejections,
+        scale_acceptance_warmup = if (settings$iter_warmup > 0L) {
+          samples$scale_accepted_warmup / settings$iter_warmup
+        } else NA_real_,
+        scale_acceptance_sampling = samples$scale_accepted_sampling / settings$iter_sampling
+      ),
+      elapsed_seconds = as.numeric(difftime(Sys.time(), started, units = "secs")),
+      trace = if (isTRUE(settings$save_traces)) data.frame(
+        iteration = seq_along(samples$log_joint_trace),
+        warmup = seq_along(samples$log_joint_trace) <= settings$iter_warmup,
+        joint_log_kernel = samples$log_joint_trace
+      ) else NULL,
+      error = NA_character_
+    )
+  }, error = function(error) list(status = "error", draw_id = as.integer(job$draw_id),
+    error = conditionMessage(error),
+    elapsed_seconds = as.numeric(difftime(Sys.time(), started, units = "secs"))))
+}
+
 tf_em_fit_one_draw <- function(job, common, settings) {
+  if (identical(settings$algorithm, "gibbs_ars")) {
+    return(tf_em_gibbs_fit_one_draw(job, common, settings))
+  }
   started <- Sys.time()
   tryCatch({
     eta0 <- job$eta0
@@ -680,6 +820,7 @@ tf_em_fit_one_draw <- function(job, common, settings) {
     )
     beta_posterior_sample <- matrix(NA_real_, common$G, 2L)
     for (g in seq_len(common$G)) {
+      if (last_mstep$at_prior_kink[[g]]) next
       if (common$has_condition) {
         beta_posterior_sample[g, ] <- tf_em_sample_bivariate_normal(
           c(beta_mean[[g]], beta_delta[[g]]),
@@ -707,6 +848,10 @@ tf_em_fit_one_draw <- function(job, common, settings) {
       beta_control = beta_mean - 0.5 * beta_delta,
       beta_disease = beta_mean + 0.5 * beta_delta,
       beta_covariance = last_mstep$covariance,
+      beta_at_prior_kink = last_mstep$at_prior_kink,
+      beta_uncertainty_method = last_mstep$uncertainty_method,
+      mstep_branch_convergence = last_mstep$branch_convergence,
+      beta_estimation = "conditional_MAP",
       beta_posterior_sample_mean = beta_posterior_sample[, 1L],
       beta_posterior_sample_delta = beta_posterior_sample[, 2L],
       activity_mean = final_estep$mean,
@@ -742,6 +887,81 @@ tf_em_fit_one_draw <- function(job, common, settings) {
 
 tf_em_worker_entry <- function(job) {
   tf_em_fit_one_draw(job, .tf_em_worker_common, .tf_em_worker_settings)
+}
+
+tf_em_summarize_gibbs_results <- function(summary, draw_results, common, settings) {
+  draw_results <- draw_results[order(as.integer(names(draw_results)))]
+  count <- length(draw_results)
+  for (prefix in c("beta_mean", "beta_delta", "beta_control", "beta_disease")) {
+    components <- lapply(draw_results, function(result) {
+      result$coefficient_posterior_summary[[prefix]]
+    })
+    component_mean <- vapply(components, function(value) value[, "mean"], numeric(common$G))
+    component_variance <- vapply(components, function(value) value[, "sd"] ^ 2, numeric(common$G))
+    mean <- rowMeans(matrix(component_mean, nrow = common$G))
+    variance <- rowMeans(matrix(component_variance + component_mean ^ 2, nrow = common$G)) - mean ^ 2
+    summary$beta_summary[[paste0(prefix, "_mean")]] <- mean
+    summary$beta_summary[[paste0(prefix, "_sd")]] <- sqrt(pmax(variance, 0))
+    if (count == 1L) {
+      for (quantile in c("q05", "median", "q95")) {
+        summary$beta_summary[[paste0(prefix, "_", quantile)]] <- components[[1]][, quantile]
+      }
+    }
+  }
+  if (!common$has_condition) {
+    columns <- grep("^beta_(control|disease)_", names(summary$beta_summary), value = TRUE)
+    summary$beta_summary[columns] <- NA_real_
+  }
+  summary$beta_summary$beta_mean_map <- NA_real_
+  summary$beta_summary$beta_delta_map <- NA_real_
+  summary$beta_summary$beta_at_prior_kink <- FALSE
+  summary$beta_summary$beta_estimation <- "posterior_mean"
+  summary$beta_summary$beta_uncertainty_method <- "gibbs_ars_empirical_posterior"
+  summary$beta_mean_posterior_mean_by_draw <- summary$beta_mean_map_by_draw
+  summary$beta_delta_posterior_mean_by_draw <- summary$beta_delta_map_by_draw
+  summary$beta_mean_posterior_sample_by_draw <- summary$beta_mean_local_normal_sample_by_draw
+  summary$beta_delta_posterior_sample_by_draw <- summary$beta_delta_local_normal_sample_by_draw
+  # Preserve historical fields without labelling posterior means as MAP or
+  # actual Gibbs draws as local Gaussian approximations.
+  unavailable <- matrix(NA_real_, count, common$G,
+    dimnames = dimnames(summary$beta_mean_map_by_draw))
+  for (field in c("beta_mean_map_by_draw", "beta_delta_map_by_draw",
+      "beta_mean_local_normal_sample_by_draw", "beta_delta_local_normal_sample_by_draw",
+      "beta_mean_laplace_sample_by_draw", "beta_delta_laplace_sample_by_draw")) {
+    summary[[field]] <- unavailable
+  }
+  summary$summary_method <- if (count == 1L) {
+    "conditional_gibbs_ars_posterior"
+  } else "equal_weight_nuisance_mixture_of_gibbs_ars_posteriors"
+  summary$posterior_quantile_method <- if (count == 1L) {
+    "empirical_all_retained_gibbs_draws"
+  } else {
+    "approximate_mixture_quantiles_from_one_joint_gibbs_draw_per_nuisance_component"
+  }
+  summary$sampling_diagnostics <- stats::setNames(
+    lapply(draw_results, `[[`, "sampling_diagnostics"), names(draw_results))
+  summary$convergence_summary$algorithm <- "gibbs_ars"
+  summary$convergence_summary$iter_warmup <- settings$iter_warmup
+  summary$convergence_summary$iter_sampling <- settings$iter_sampling
+  summary$convergence_summary$scale_acceptance_sampling <- vapply(draw_results,
+    function(result) result$sampling_diagnostics$scale_acceptance_sampling, numeric(1))
+  if (common$has_condition) {
+    sampled <- summary$activity_condition_difference_summary$contrast_type ==
+      "one_activity_posterior_sample_per_cell"
+    summary$activity_condition_difference_summary$contrast_type[sampled] <-
+      "one_joint_gibbs_draw_per_nuisance_component"
+    if (count == 1L) {
+      values <- draw_results[[1]]$activity_condition_difference_samples
+      quantiles <- stats::quantile(values, c(0.05, 0.5, 0.95), names = FALSE)
+      summary$activity_condition_difference_summary[sampled,
+        c("mean", "sd", "q05", "median", "q95", "probability_disease_higher")] <-
+          list(mean(values), stats::sd(values), quantiles[[1]], quantiles[[2]],
+            quantiles[[3]], mean(values > 0))
+      summary$activity_condition_difference_summary$contrast_type[sampled] <-
+        "all_retained_joint_gibbs_draws"
+    }
+  }
+  summary
 }
 
 tf_em_summarize_draw_results <- function(draw_results, common, settings) {
@@ -783,9 +1003,11 @@ tf_em_summarize_draw_results <- function(draw_results, common, settings) {
   total_mean <- rowMeans(activity_mean)
   total_variance <- rowMeans(activity_variance + activity_mean ^ 2) - total_mean ^ 2
   total_active_probability <- rowMeans(activity_active_probability)
-  total_given_active_mean <- rowMeans(
-    activity_active_probability * activity_given_active_mean
-  ) / pmax(total_active_probability, .Machine$double.eps)
+  weighted_active_mean <- activity_active_probability * activity_given_active_mean
+  weighted_active_mean[activity_active_probability == 0] <- 0
+  total_given_active_mean <- rowMeans(weighted_active_mean) /
+    pmax(total_active_probability, .Machine$double.eps)
+  total_given_active_mean[total_active_probability == 0] <- NA_real_
   activity_quantiles <- if (R == 1L) {
     cbind(
       draw_results[[1]]$activity_q05,
@@ -824,8 +1046,12 @@ tf_em_summarize_draw_results <- function(draw_results, common, settings) {
     disease_sample <- mean_sample + 0.5 * delta_sample
     summarize_matrix <- function(x, prefix) {
       quantile_matrix <- t(apply(
-        x, 2L, stats::quantile,
-        probs = c(0.05, 0.5, 0.95), names = FALSE, na.rm = TRUE
+        x, 2L, function(value) {
+          # A missing kink approximation must not silently drop that nuisance
+          # component and report intervals from the remaining draws only.
+          if (any(!is.finite(value))) return(rep(NA_real_, 3L))
+          stats::quantile(value, probs = c(0.05, 0.5, 0.95), names = FALSE)
+        }
       ))
       data.frame(
         mean = colMeans(x),
@@ -974,17 +1200,28 @@ tf_em_summarize_draw_results <- function(draw_results, common, settings) {
   } else {
     summarize_beta(beta_mean_sample, beta_delta_sample)
   }
+  kink_by_draw <- t(bind_numeric("beta_at_prior_kink", G))
+  beta_summary$beta_mean_map <- colMeans(beta_mean_map)
+  beta_summary$beta_delta_map <- colMeans(beta_delta_map)
+  beta_summary$beta_at_prior_kink <- colSums(kink_by_draw) > 0
+  beta_summary$beta_estimation <- "conditional_MAP"
+  beta_summary$beta_uncertainty_method <- ifelse(beta_summary$beta_at_prior_kink,
+    "unavailable_at_prior_kink", "local_complete_data_normal_not_full_posterior")
+  approximation_columns <- grep(
+    "^beta_(mean|delta|control|disease)_(mean|sd|q05|median|q95)$",
+    names(beta_summary), value = TRUE)
+  beta_summary[beta_summary$beta_at_prior_kink, approximation_columns] <- NA_real_
   if (!common$has_condition) {
     condition_specific_columns <- grep(
       "^beta_(control|disease)_", names(beta_summary), value = TRUE
     )
     beta_summary[condition_specific_columns] <- NA_real_
   }
-  list(
+  result <- list(
     activity_summary = activity_summary,
     beta_summary = beta_summary,
     summary_method = if (R == 1L) {
-      "conditional_posterior_and_laplace"
+      "conditional_activity_and_local_complete_data_beta_approximation"
     } else {
       "equal_weight_nuisance_mixture"
     },
@@ -998,12 +1235,21 @@ tf_em_summarize_draw_results <- function(draw_results, common, settings) {
     activity_mixture_sample = activity_sample,
     beta_mean_map_by_draw = beta_mean_map,
     beta_delta_map_by_draw = beta_delta_map,
+    beta_at_prior_kink_by_draw = kink_by_draw,
+    beta_mean_local_normal_sample_by_draw = beta_mean_sample,
+    beta_delta_local_normal_sample_by_draw = beta_delta_sample,
+    # Legacy field names retained as aliases; these are local normal heuristics,
+    # not samples from the asymmetric-Laplace joint posterior.
     beta_mean_laplace_sample_by_draw = beta_mean_sample,
     beta_delta_laplace_sample_by_draw = beta_delta_sample
   )
+  if (identical(settings$algorithm, "gibbs_ars")) {
+    result <- tf_em_summarize_gibbs_results(result, draw_results, common, settings)
+  }
+  result
 }
 
-#' Run spike-and-slab latent-activity EM over Stage 2 nuisance draws.
+#' Run spike-and-slab latent-activity inference over Stage 2 nuisance draws.
 #'
 #' Each cell has an exact inactive state A = 0 and a positive truncated-normal
 #' slab anchored to target-TF normalized expression. The negative-binomial
@@ -1013,19 +1259,26 @@ tf_em_summarize_draw_results <- function(draw_results, common, settings) {
 #' active probability of 0.9. The gate is soft in both groups, so zero TF
 #' expression strongly downweights activity without forcing it to exactly zero.
 #'
-#' With `nuisance_draw_count = 0`, eta0 and phi use their Stage 2 posterior
-#' means and one EM fit is run. The default count is 100. A positive count
+#' With the default `nuisance_draw_count = 0`, eta0 and phi use their Stage 2
+#' posterior means in one fit. A positive count
 #' reproducibly selects that many posterior draws without replacement
 #' and fits them independently; their activity posteriors form
 #' an equal-weight mixture. Explicit draw IDs remain available as an override.
-#' Stage 2 target-beta posterior means initialize EM but are not reused as
-#' priors. Every M-step instead uses the posterior-informed Normal prior that
-#' was supplied to Stage 2. Confounder effects are fixed within each nuisance
+#' The default Gibbs sampler uses ARS for the log-concave coefficient and
+#' positive-activity conditionals, an auxiliary slab variable for the zero
+#' spike, and a joint coefficient/activity scale Metropolis move. Warmup and
+#' retained iterations each default to 500. Stage 2 target-beta posterior means
+#' initialize the sampler and the network asymmetric-Laplace prior is retained.
+#' One chain is run per nuisance component, so convergence is reported as
+#' unknown, with within-chain ESS and proposal acceptance diagnostics.
+#' Set `algorithm = "quadrature_em"` for the conditional-MAP EM implementation
+#' and its local complete-data Gaussian uncertainty away from beta = 0.
+#' Confounder effects are fixed within each nuisance
 #' draw, so their Stage 2 posterior uncertainty is propagated only when more
 #' than one nuisance draw is requested.
 run_TF_EM_latent_activity <- function(
   stage2_input,
-  nuisance_draw_count = 100L,
+  nuisance_draw_count = 0L,
   nuisance_draw_ids = NULL,
   cores = 4L,
   kappa = 1,
@@ -1048,9 +1301,23 @@ run_TF_EM_latent_activity <- function(
   output_file = NULL,
   resume = TRUE,
   retry_errors = TRUE,
-  save_traces = FALSE
+  save_traces = FALSE,
+  algorithm = "gibbs_ars",
+  iter_warmup = 500L,
+  iter_sampling = 500L,
+  scale_move_sd = 0.1
 ) {
   stage2_input <- tf_em_validate_input(stage2_input)
+  algorithm <- match.arg(algorithm, c("gibbs_ars", "quadrature_em"))
+  iter_warmup <- as.integer(iter_warmup[[1]])
+  iter_sampling <- as.integer(iter_sampling[[1]])
+  scale_move_sd <- as.numeric(scale_move_sd[[1]])
+  if (is.na(iter_warmup) || iter_warmup < 0L ||
+      is.na(iter_sampling) || iter_sampling < 2L ||
+      !is.finite(scale_move_sd) || scale_move_sd <= 0 ||
+      as.double(iter_warmup) + as.double(iter_sampling) > .Machine$integer.max) {
+    tf_em_stop("Sampling needs nonnegative warmup, at least two retained draws and a positive scale-move SD.")
+  }
   cores <- as.integer(cores[[1]])
   quadrature_nodes <- as.integer(quadrature_nodes[[1]])
   max_iter <- as.integer(max_iter[[1]])
@@ -1120,7 +1387,9 @@ run_TF_EM_latent_activity <- function(
       )
     )
   }
-  quadrature <- tf_em_gauss_legendre(quadrature_nodes)
+  quadrature <- if (identical(algorithm, "quadrature_em")) {
+    tf_em_gauss_legendre(quadrature_nodes)
+  } else NULL
   sigma_activity <- as.numeric(kappa) * stage2_input$target_tf_scale
   expression_is_zero <-
     stage2_input$target_tf_expression <= expression_zero_tolerance
@@ -1147,8 +1416,9 @@ run_TF_EM_latent_activity <- function(
     target_scale = as.numeric(stage2_input$target_tf_scale),
     beta_mean_init = as.numeric(stage2_input$beta_target_mean_init),
     beta_delta_init = as.numeric(stage2_input$beta_target_delta_init),
-    beta_prior_mean = as.numeric(stage2_input$beta_prior_mean),
-    beta_prior_sd = as.numeric(stage2_input$beta_prior_sd),
+    beta_prior_family = stage2_input$beta_prior_family,
+    beta_lambda_positive = as.numeric(stage2_input$beta_lambda_positive),
+    beta_lambda_negative = as.numeric(stage2_input$beta_lambda_negative),
     target_interaction_sd = as.numeric(stage2_input$target_interaction_sd),
     cell_names = stage2_input$cell_names,
     target_genes = stage2_input$target_genes,
@@ -1157,6 +1427,17 @@ run_TF_EM_latent_activity <- function(
     quadrature = quadrature
   )
   settings <- list(
+    algorithm = algorithm,
+    algorithm_version = if (identical(algorithm, "gibbs_ars")) {
+      "knowledge_asymmetric_laplace_gibbs_ars_v1"
+    } else "knowledge_asymmetric_laplace_em_v2",
+    iter_warmup = iter_warmup,
+    iter_sampling = iter_sampling,
+    scale_move_sd = scale_move_sd,
+    beta_prior_family = "laplace",
+    beta_uncertainty = if (identical(algorithm, "gibbs_ars")) {
+      "empirical_conditional_joint_posterior"
+    } else "local_complete_data_normal_not_full_posterior; unavailable_at_prior_kink",
     quadrature_nodes = quadrature_nodes,
     max_iter = max_iter,
     min_iter = min_iter,
@@ -1178,12 +1459,22 @@ run_TF_EM_latent_activity <- function(
     hard_zero_expression = FALSE,
     activity_model = "spike_and_truncated_normal_slab"
   )
+  # Dimensions and draw IDs do not identify the actual nuisance values. Hash
+  # the complete handoff so a changed Stage 2 fit cannot reuse stale Stage 3.
+  input_hash_file <- tempfile("tfregact-stage3-input-", fileext = ".rds")
+  on.exit(unlink(input_hash_file), add = TRUE)
+  saveRDS(stage2_input, input_hash_file, compress = FALSE, version = 2)
+  input_hash <- unname(tools::md5sum(input_hash_file))
   signature <- paste(
+    input_hash,
     stage2_input$interface_version,
     stage2_input$target_tf,
     stage2_input$N,
     stage2_input$G,
     stage2_input$S,
+    stage2_input$beta_prior_family,
+    paste(format(stage2_input$beta_lambda_positive, digits = 17), collapse = ","),
+    paste(format(stage2_input$beta_lambda_negative, digits = 17), collapse = ","),
     paste(stage2_input$target_genes, collapse = ","),
     nuisance_mode,
     nuisance_draw_count,
@@ -1240,14 +1531,15 @@ run_TF_EM_latent_activity <- function(
   }
   save_checkpoint <- function() {
     saveRDS(list(
-      interface_version = "tf_em_checkpoint_v1",
+      interface_version = "tf_em_checkpoint_v2",
       em_signature = signature,
       draw_results = draw_results,
       settings = settings
     ), checkpoint_file)
   }
   message(sprintf(
-    "Stage2 EM nuisance mode: %s; %d fit(s), %d completed, %d pending, %d workers.",
+    "Stage3 %s nuisance mode: %s; %d fit(s), %d completed, %d pending, %d workers.",
+    algorithm,
     nuisance_mode,
     length(nuisance_draw_ids), sum(!vapply(draw_results, is.null, logical(1))),
     length(pending), worker_count
@@ -1348,7 +1640,10 @@ run_TF_EM_latent_activity <- function(
   }
   summarized <- tf_em_summarize_draw_results(draw_results, common, settings)
   result <- c(list(
-    interface_version = "tf_em_latent_activity_fit_v1",
+    interface_version = if (identical(algorithm, "gibbs_ars")) {
+      "tf_em_latent_activity_fit_v3"
+    } else "tf_em_latent_activity_fit_v2",
+    algorithm = algorithm,
     target_tf = stage2_input$target_tf,
     has_condition = isTRUE(stage2_input$has_condition),
     nuisance_mode = nuisance_mode,

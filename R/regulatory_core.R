@@ -877,6 +877,10 @@ filter_TF_analysis_object_by_beta_ci <- function(
   filtered_object$sample_column <- analysis_object$sample_column
   filtered_object$biological_sample <- analysis_object$biological_sample
   attr(filtered_object, "stage1_beta_summary") <- filter_table[keep, , drop = FALSE]
+  # Preserve the original prior before subsetting; Stage 2 aligns it by TF name.
+  attr(filtered_object, "stage1_prior_data") <- fit_result$stan_data[
+    c("P", "confidence", "direction", "gamma", "eta", "r_dir")]
+  attr(filtered_object, "stage1_prior_feature_names") <- fit_result$feature_names
   attr(filtered_object, "beta_ci_interval") <- interval
   attr(filtered_object, "tf_correlation_matrix") <- correlation_result$cor_mat
   attr(filtered_object, "tf_correlation_threshold") <- correlation_threshold
@@ -1078,21 +1082,42 @@ tf_condition_from_sample <- function(
   condition
 }
 
+tf_stage2_prior_data_from_stage1 <- function(analysis_object, stage1_fit_result) {
+  source <- if (is.null(stage1_fit_result)) {
+    attr(analysis_object, "stage1_prior_data")
+  } else stage1_fit_result$stan_data
+  features <- if (is.null(stage1_fit_result)) {
+    attr(analysis_object, "stage1_prior_feature_names")
+  } else stage1_fit_result$feature_names
+  if (is.null(features)) features <- attr(source, "feature_names")
+  if (is.null(source) || is.null(features) || length(features) != source$P ||
+      anyNA(features) || anyDuplicated(toupper(features))) {
+    tf_model_stop("Stage 2 requires the original Stage 1 prior data and feature names; refit legacy Stage 1 results.")
+  }
+  tf_stage2_knowledge_prior(source)
+  index <- match(toupper(rownames(analysis_object$expr)), toupper(features))
+  if (anyNA(index)) tf_model_stop("Stage 1 knowledge-prior metadata do not cover all retained TFs.")
+  list(confidence = as.numeric(source$confidence[index]),
+    direction = as.integer(source$direction[index]), gamma = source$gamma,
+    eta = source$eta, r_dir = source$r_dir)
+}
+
 tf_prepare_stage2_stan_data <- function(
   analysis_object,
   stage1_fit_result,
-  direction_effect,
-  beta_sd_floor,
-  stage1_sd_multiplier,
-  control_level,
-  disease_level,
-  confidence_min,
-  confidence_max,
+  direction_effect = NULL,
+  beta_sd_floor = NULL,
+  stage1_sd_multiplier = NULL,
+  control_level = NULL,
+  disease_level = NULL,
+  confidence_min = 1,
+  confidence_max = 10,
   nuisance_prior_scale = 1,
   target_interaction = FALSE,
   target_interaction_sd = 0.5
 ) {
   tf_model_validate_object(analysis_object)
+  tf_stage2_warn_legacy_prior_arguments(direction_effect, beta_sd_floor, stage1_sd_multiplier)
 
   if (!is.logical(target_interaction) || length(target_interaction) != 1L ||
       is.na(target_interaction)) {
@@ -1105,19 +1130,22 @@ tf_prepare_stage2_stan_data <- function(
     tf_model_stop("`target_interaction_sd` must be one finite positive number.")
   }
 
+  prior_data <- tf_stage2_prior_data_from_stage1(analysis_object, stage1_fit_result)
   base_data <- tf_prepare_stan_data(
     analysis_object = analysis_object,
-    gamma = 1,
-    # Stage 2 carries confidence only for provenance; use the same default
-    # scale exponent as Stage 1 so the shared data contract is coherent.
-    eta = 0.5,
-    r_dir = 3,
+    gamma = prior_data$gamma,
+    eta = prior_data$eta,
+    r_dir = prior_data$r_dir,
     confidence_min = confidence_min,
     confidence_max = confidence_max,
     control_level = control_level,
     disease_level = disease_level,
     nuisance_prior_scale = nuisance_prior_scale
   )
+  # Copy fitted Stage 1 values exactly, including nondefault confidence clipping.
+  base_data$confidence <- prior_data$confidence
+  base_data$direction <- prior_data$direction
+  attr(base_data, "confidence_used") <- prior_data$confidence
   beta_summary <- tf_stage2_beta_summary(
     analysis_object = analysis_object,
     stage1_fit_result = stage1_fit_result
@@ -1144,21 +1172,12 @@ tf_prepare_stage2_stan_data <- function(
     "batch",
     "batch_level_design",
     "log_offset",
-    "alpha_prior_sd"
+    "alpha_prior_sd", "confidence", "direction", "gamma", "eta", "r_dir"
   )
   stan_data <- base_data[stan_data_names]
 
-  stage2_prior <- tf_stage2_prior_from_stage1(
-    stage1_beta_mean = beta_summary$stage1_beta_mean,
-    stage1_beta_sd = beta_summary$stage1_beta_sd,
-    direction = base_data$direction,
-    direction_effect = direction_effect,
-    beta_sd_floor = beta_sd_floor,
-    stage1_sd_multiplier = stage1_sd_multiplier
-  )
-  stan_data$beta_prior_mean <- stage2_prior$beta_prior_mean
-  stan_data$beta_prior_sd <- stage2_prior$beta_prior_sd
-  stan_data$beta_init <- stage2_prior$stage1_beta_mean
+  stage2_prior <- tf_stage2_knowledge_prior(stan_data)
+  stan_data$beta_init <- beta_summary$stage1_beta_mean
 
   target_tf <- as.character(attr(base_data, "target")[[1]])
   target_tf_index <- match(target_tf, attr(base_data, "feature_names"))
@@ -1200,9 +1219,9 @@ run_TF_stage2_directional_model <- function(
   analysis_object,
   stage1_fit_result,
   stan_file,
-  direction_effect,
-  beta_sd_floor,
-  stage1_sd_multiplier,
+  direction_effect = NULL,
+  beta_sd_floor = NULL,
+  stage1_sd_multiplier = NULL,
   control_level,
   disease_level,
   confidence_min,

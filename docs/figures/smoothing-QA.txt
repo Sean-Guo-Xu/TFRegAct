@@ -1,6 +1,5 @@
-Exact README examples executed on all 14627 macrophages; no sampling or score clipping.
-Smoothing scores and cell-level p-values match the previous saved results.
-Both box quartiles verified on the untransformed scores.
-FeaturePlot uses a linear colour scale; original UMAP coordinates retained.
-Cell-level Welch tests are exploratory; cells within samples and smoothed scores are dependent.
-R only; 600-dpi PNG and editable PDF/SVG; centered titles and no captions.
+Both README plots use saved original and smoothed scores for the same 14627 macrophages.
+Each UMAP panel contains all cells with the original coordinates and a shared linear colour scale from 0 to 3.423275138.
+All four box quartile triplets were verified on the untransformed scores. Both panels share a linear y-axis.
+Both cell-level Welch p-values match the saved results. These tests are exploratory because cells within samples and smoothed scores are dependent.
+R exports include 600-dpi PNG and editable PDF/SVG.

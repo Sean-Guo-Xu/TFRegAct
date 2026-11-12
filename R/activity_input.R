@@ -473,7 +473,7 @@ build_TF_stage1_screening_input <- function(
     isTRUE(ready_entries[[1]]$condition_model)
 
   attr(result, "model_version") <- tf_shared_stage2_model_version()
-  attr(result, "prior_family") <- "normal"
+  attr(result, "prior_family") <- "laplace"
   attr(result, "has_condition") <- input_has_condition
   attr(result, "condition_interaction") <- input_has_condition
   attr(result, "stage2_interface_ready") <- TRUE

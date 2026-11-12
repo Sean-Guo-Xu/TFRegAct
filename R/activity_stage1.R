@@ -4,6 +4,19 @@ tf_stage1_screening_stop <- function(...) {
   stop(sprintf(...), call. = FALSE)
 }
 
+tf_stage1_screening_quantile_interval <- function(draws, level) {
+  if (!is.numeric(level) || length(level) != 1L || !is.finite(level) ||
+      level <= 0 || level >= 1) {
+    tf_stage1_screening_stop("The screening interval level must be strictly between 0 and 1.")
+  }
+  if (!is.numeric(draws) || !is.null(dim(draws)) || !length(draws) ||
+      any(!is.finite(draws))) {
+    tf_stage1_screening_stop("Screening intervals require a nonempty finite vector of posterior draws.")
+  }
+  stats::quantile(draws, probs = c((1 - level) / 2, (1 + level) / 2),
+                  names = FALSE, type = 7L)
+}
+
 tf_stage1_screening_require_pkg <- function(package) {
   if (!requireNamespace(package, quietly = TRUE)) {
     tf_stage1_screening_stop("Package `%s` is required.", package)
@@ -26,9 +39,7 @@ tf_stage1_screening_resolve_stan_file <- function(
   prior_family
 ) {
   if (is.null(stan_file) || !nzchar(as.character(stan_file[[1]]))) {
-    stan_file <- if (identical(prior_family, "laplace")) {
-      "TF_directional_nb_model.stan"
-    } else {
+    stan_file <- if (identical(attr(screening_input, "pipeline_stage"), "mcmc_input")) {
       input_stan_file <- attr(screening_input, "stan_file")
       if (is.null(input_stan_file) ||
           !nzchar(as.character(input_stan_file[[1]]))) {
@@ -36,6 +47,8 @@ tf_stage1_screening_resolve_stan_file <- function(
       } else {
         input_stan_file
       }
+    } else {
+      "TF_directional_nb_model.stan"
     }
   }
   stan_file <- as.character(stan_file[[1]])
@@ -47,7 +60,9 @@ tf_stage1_screening_default_output <- function(screening_input, inference) {
   if (is.null(target_tf) || !nzchar(as.character(target_tf[[1]]))) {
     target_tf <- "target_TF"
   }
-  suffix <- if (identical(inference, "mcmc")) {
+  suffix <- if (identical(attr(screening_input, "pipeline_stage"), "mcmc_input")) {
+    "stage2_laplace_mcmc_results.rds"
+  } else if (identical(inference, "mcmc")) {
     "stage1_screening_stage2_ready_results.rds"
   } else {
     "stage1_screening_stage2_ready_results_variational.rds"
@@ -72,17 +87,11 @@ tf_stage1_screening_input_signature <- function(screening_input, ready_genes) {
       entry$stan_data$use_target_interaction,
       sum(entry$stan_data$condition == 0L),
       sum(entry$stan_data$condition == 1L),
-      if (!is.null(entry$stan_data$beta_prior_mean)) {
-        paste(signif(entry$stan_data$beta_prior_mean, 12), collapse = ",")
-      } else {
-        entry$stan_data$beta_prior_scale
-      },
-      if (!is.null(entry$stan_data$beta_prior_sd)) {
-        paste(signif(entry$stan_data$beta_prior_sd, 12), collapse = ",")
-      } else {
-        entry$stan_data$eta
-      },
+      entry$stan_data$gamma,
+      entry$stan_data$eta,
       if (is.null(entry$stan_data$r_dir)) NA_real_ else entry$stan_data$r_dir,
+      paste(signif(entry$stan_data$confidence, 12), collapse = ","),
+      paste(entry$stan_data$direction, collapse = ","),
       entry$stan_data$target_interaction_sd,
       paste(entry$feature_names, collapse = ","),
       sep = "|"
@@ -92,6 +101,7 @@ tf_stage1_screening_input_signature <- function(screening_input, ready_genes) {
     attr(screening_input, "target_tf"),
     attr(screening_input, "cell_count"),
     attr(screening_input, "model_version"),
+    attr(screening_input, "pipeline_stage"),
     paste(model_parts, collapse = ";"),
     sep = "::"
   )
@@ -156,12 +166,13 @@ tf_stage1_screening_validate_input <- function(screening_input) {
       "Q", "W", "W_prior_scale", "has_condition", "condition_w_index", "condition",
       "K_batch", "batch", "batch_level_design", "target_tf_index",
       "use_target_interaction", "target_condition_centered",
-      "target_interaction_sd"
+      "target_interaction_sd", "confidence", "direction", "gamma", "eta",
+      "r_dir", "alpha_prior_sd"
     )
     if (identical(attr(screening_input, "pipeline_stage"), "mcmc_input")) {
       required_stan_fields <- c(
         required_stan_fields,
-        "beta_prior_mean", "beta_prior_sd", "alpha_prior_sd"
+        "beta_init"
       )
     }
     if (!all(required_stan_fields %in% names(entry$stan_data)) ||
@@ -180,6 +191,7 @@ tf_stage1_screening_validate_input <- function(screening_input) {
         gene
       )
     }
+    tf_stage2_knowledge_prior(entry$stan_data)
     has_condition <- identical(as.integer(entry$stan_data$has_condition), 1L)
     use_interaction <- identical(
       as.integer(entry$stan_data$use_target_interaction),
@@ -243,7 +255,8 @@ tf_stage1_screening_summarize_fit <- function(
   stage2_draw_count,
   prior_family,
   target_interval,
-  confounder_interval
+  confounder_interval,
+  expected_draw_count = NULL
 ) {
   P <- entry$stan_data$P
   use_batch <- if (is.null(entry$use_batch)) {
@@ -270,14 +283,22 @@ tf_stage1_screening_summarize_fit <- function(
     batch_variables,
     target_variables
   )
-  joint_draws <- as.matrix(fit$draws(
+  # posterior::draws_matrix keeps a one-column matrix after subsetting, even
+  # through as.matrix(). Use base matrix semantics for scalar draw vectors.
+  joint_draws <- unclass(as.matrix(fit$draws(
     variables = c(
       "alpha", "condition_effect", "phi", "beta",
       if (use_batch) "batch_effect" else character(0),
       target_variables
     ),
     format = "draws_matrix"
-  ))
+  )))
+  if (!is.null(expected_draw_count) && nrow(joint_draws) != expected_draw_count) {
+    tf_stage1_screening_stop(
+      "Incomplete Stage 2 posterior for target gene `%s`: expected %d draws, received %d.",
+      entry$target_gene, expected_draw_count, nrow(joint_draws)
+    )
+  }
   variable_match <- match(requested_variables, colnames(joint_draws))
   if (anyNA(variable_match)) {
     tf_stage1_screening_stop(
@@ -330,41 +351,20 @@ tf_stage1_screening_summarize_fit <- function(
   edge_table <- entry$predictor_edges[edge_match, , drop = FALSE]
   is_target <- seq_len(P) == entry$target_tf_index
   interval_level <- ifelse(is_target, target_interval, confounder_interval)
-  interval_column <- function(level, lower = TRUE) {
-    if (isTRUE(all.equal(level, 0.90, tolerance = 1e-12))) {
-      if (lower) 2L else 4L
-    } else if (isTRUE(all.equal(level, 0.95, tolerance = 1e-12))) {
-      if (lower) 1L else 5L
-    } else {
-      tf_stage1_screening_stop(
-        "Only 90%% and 95%% screening intervals are currently supported."
-      )
-    }
-  }
-  interval_lower <- vapply(seq_len(P), function(j) {
-    quantiles[j, interval_column(interval_level[[j]], lower = TRUE)]
-  }, numeric(1))
-  interval_upper <- vapply(seq_len(P), function(j) {
-    quantiles[j, interval_column(interval_level[[j]], lower = FALSE)]
-  }, numeric(1))
+  interval_bounds <- vapply(seq_len(P), function(j) {
+    tf_stage1_screening_quantile_interval(beta_draws[, j], interval_level[[j]])
+  }, numeric(2L))
+  interval_lower <- interval_bounds[1L, ]
+  interval_upper <- interval_bounds[2L, ]
 
-  if (identical(prior_family, "laplace")) {
-    prior_scale <- entry$stan_data$beta_prior_scale *
-      (entry$stan_data$confidence / 10) ^ entry$stan_data$eta
-    directional <- entry$stan_data$direction != 0L
-    prior_mean <- numeric(length(prior_scale))
-    prior_mean[directional] <-
-      entry$stan_data$direction[directional] *
-      prior_scale[directional] *
-      (entry$stan_data$r_dir - 1) / entry$stan_data$r_dir
-    prior_sd <- rep(sqrt(2), length(prior_scale)) * prior_scale
-    prior_sd[directional] <- prior_scale[directional] *
-      sqrt(1 + 1 / entry$stan_data$r_dir ^ 2)
-  } else {
-    prior_mean <- as.numeric(entry$stan_data$beta_prior_mean)
-    prior_sd <- as.numeric(entry$stan_data$beta_prior_sd)
-    prior_scale <- prior_sd
-  }
+  knowledge_prior <- tf_stage2_knowledge_prior(entry$stan_data)
+  lambda_positive <- knowledge_prior$beta_lambda_positive
+  lambda_negative <- knowledge_prior$beta_lambda_negative
+  # These are descriptive Laplace moments, not Normal-prior hyperparameters.
+  prior_mean <- 1 / lambda_positive - 1 / lambda_negative
+  prior_sd <- sqrt(1 / lambda_positive ^ 2 + 1 / lambda_negative ^ 2)
+  prior_scale <- entry$stan_data$gamma *
+    (pmax(entry$stan_data$confidence, 1) / 10) ^ entry$stan_data$eta
   parameter_table <- data.frame(
     variable = beta_variables,
     beta_index = seq_len(P),
@@ -377,6 +377,8 @@ tf_stage1_screening_summarize_fit <- function(
     prior_mean = as.numeric(prior_mean),
     prior_scale = as.numeric(prior_scale),
     prior_sd = as.numeric(prior_sd),
+    beta_lambda_positive = as.numeric(lambda_positive),
+    beta_lambda_negative = as.numeric(lambda_negative),
     beta_mean = colMeans(beta_draws),
     beta_sd = apply(beta_draws, 2, stats::sd),
     beta_median = quantiles[, 3],
@@ -437,22 +439,33 @@ tf_stage1_screening_summarize_fit <- function(
   parameter_table$beta_control_interval_upper <- NA_real_
   parameter_table$beta_disease_interval_lower <- NA_real_
   parameter_table$beta_disease_interval_upper <- NA_real_
-  target_lower_column <- interval_column(target_interval, lower = TRUE)
-  target_upper_column <- interval_column(target_interval, lower = FALSE)
+  target_bounds <- vapply(seq_len(2L), function(j) {
+    tf_stage1_screening_quantile_interval(target_draws[, j], target_interval)
+  }, numeric(2L))
   parameter_table$beta_control_interval_lower[is_target] <-
-    target_quantiles[1, target_lower_column]
+    target_bounds[1L, 1L]
   parameter_table$beta_control_interval_upper[is_target] <-
-    target_quantiles[1, target_upper_column]
+    target_bounds[2L, 1L]
   parameter_table$beta_disease_interval_lower[is_target] <-
-    target_quantiles[2, target_lower_column]
+    target_bounds[1L, 2L]
   parameter_table$beta_disease_interval_upper[is_target] <-
-    target_quantiles[2, target_upper_column]
+    target_bounds[2L, 2L]
   parameter_table$control_interval_excludes_zero[is_target] <-
-    target_quantiles[1, target_lower_column] > 0 |
-      target_quantiles[1, target_upper_column] < 0
+    target_bounds[1L, 1L] > 0 | target_bounds[2L, 1L] < 0
   parameter_table$disease_interval_excludes_zero[is_target] <-
-    target_quantiles[2, target_lower_column] > 0 |
-      target_quantiles[2, target_upper_column] < 0
+    target_bounds[1L, 2L] > 0 | target_bounds[2L, 2L] < 0
+
+  # Preserve every target draw for later interval changes, independently of
+  # the compact joint-draw budget used by the next stage.
+  target_screening_draws <- list(
+    interface_version = "tf_target_screening_draws_v1",
+    draw_count = nrow(joint_draws),
+    overall = as.numeric(beta_draws[, entry$target_tf_index])
+  )
+  if (entry$stan_data$has_condition == 1L) {
+    target_screening_draws$control <- as.numeric(target_draws[, 1L])
+    target_screening_draws$disease <- as.numeric(target_draws[, 2L])
+  }
 
   retained_draw_count <- if (is.null(stage2_draw_count)) {
     nrow(joint_draws)
@@ -475,8 +488,9 @@ tf_stage1_screening_summarize_fit <- function(
     matrix(0, nrow = nrow(retained_draws), ncol = 0L)
   }
   stage2_parameter_draws <- list(
-    interface_version = "tf_em_stage2_parameter_draws_v1",
+    interface_version = "tf_em_stage2_parameter_draws_v2",
     prior_family = prior_family,
+    beta_prior_family = "laplace",
     source_draw_index = retained_draw_index,
     draw_count = length(retained_draw_index),
     alpha = as.numeric(retained_draws[, "alpha"]),
@@ -495,8 +509,9 @@ tf_stage1_screening_summarize_fit <- function(
     target_interaction_sd = as.numeric(
       entry$stan_data$target_interaction_sd
     ),
-    beta_prior_mean = stats::setNames(prior_mean, entry$feature_names),
-    beta_prior_sd = stats::setNames(prior_sd, entry$feature_names)
+    beta_lambda_positive = stats::setNames(lambda_positive, entry$feature_names),
+    beta_lambda_negative = stats::setNames(lambda_negative, entry$feature_names),
+    knowledge_prior = knowledge_prior
   )
 
   finite_rhat <- parameter_table$rhat[is.finite(parameter_table$rhat)]
@@ -529,6 +544,7 @@ tf_stage1_screening_summarize_fit <- function(
   list(
     target_tf = parameter_table[is_target, , drop = FALSE],
     confounders = parameter_table[!is_target, , drop = FALSE],
+    target_screening_draws = target_screening_draws,
     stage2_parameter_draws = stage2_parameter_draws,
     diagnostics = diagnostics
   )
@@ -537,15 +553,29 @@ tf_stage1_screening_summarize_fit <- function(
 tf_stage1_screening_fit_one <- function(job, sampling) {
   started <- Sys.time()
   entry <- job$entry
+  is_mcmc <- identical(sampling$inference, "mcmc")
   failure_stage <- "fit"
   tryCatch({
-    fit <- if (identical(sampling$prior_family, "laplace")) {
+    fit <- if (isTRUE(sampling$is_stage2)) {
+      tf_fit_shared_stage2(
+        stan_data = entry$stan_data,
+        model = .tf_stage1_worker_model,
+        chains = sampling$chains,
+        parallel_chains = sampling$parallel_chains,
+        iter_warmup = sampling$iter_warmup,
+        iter_sampling = sampling$iter_sampling,
+        seed = sampling$seed + job$model_index + job$retry_seed_offset,
+        refresh = sampling$refresh,
+        adapt_delta = sampling$adapt_delta,
+        max_treedepth = sampling$max_treedepth
+      )
+    } else {
       tf_fit_shared_laplace_stage1(
         stan_data = entry$stan_data,
         inference = sampling$inference,
         model = .tf_stage1_worker_model,
         chains = sampling$chains,
-        parallel_chains = 1L,
+        parallel_chains = sampling$parallel_chains,
         iter_warmup = sampling$iter_warmup,
         iter_sampling = sampling$iter_sampling,
         seed = sampling$seed + job$model_index + job$retry_seed_offset,
@@ -556,28 +586,21 @@ tf_stage1_screening_fit_one <- function(job, sampling) {
         variational_iter = sampling$variational_iter,
         variational_output_samples = sampling$variational_output_samples
       )
-    } else if (identical(sampling$inference, "mcmc")) {
-      tf_fit_shared_stage2(
-        stan_data = entry$stan_data,
-        model = .tf_stage1_worker_model,
-        chains = sampling$chains,
-        parallel_chains = 1L,
-        iter_warmup = sampling$iter_warmup,
-        iter_sampling = sampling$iter_sampling,
-        seed = sampling$seed + job$model_index + job$retry_seed_offset,
-        refresh = sampling$refresh,
-        adapt_delta = sampling$adapt_delta,
-        max_treedepth = sampling$max_treedepth
-      )
-    } else {
-      .tf_stage1_worker_model$variational(
-        data = entry$stan_data,
-        seed = sampling$seed + job$model_index + job$retry_seed_offset,
-        refresh = sampling$refresh,
-        algorithm = sampling$variational_algorithm,
-        iter = sampling$variational_iter,
-        output_samples = sampling$variational_output_samples
-      )
+    }
+    expected_draw_count <- NULL
+    if (is_mcmc) {
+      stage <- if (isTRUE(sampling$is_stage2)) "Stage 2" else "Stage 1"
+      failure_stage <- paste("validate completed", stage, "chains")
+      return_codes <- fit$return_codes()
+      if (length(return_codes) != sampling$chains || anyNA(return_codes) ||
+          any(return_codes != 0L) ||
+          !identical(as.integer(fit$num_chains()), sampling$chains)) {
+        tf_stage1_screening_stop(
+          "Incomplete %s sampling for target gene `%s`: all %d chains must finish successfully.",
+          stage, entry$target_gene, sampling$chains
+        )
+      }
+      expected_draw_count <- as.double(sampling$chains) * sampling$iter_sampling
     }
     failure_stage <- "summarize posterior"
     summarized <- tf_stage1_screening_summarize_fit(
@@ -587,8 +610,13 @@ tf_stage1_screening_fit_one <- function(job, sampling) {
       stage2_draw_count = sampling$stage2_draw_count,
       prior_family = sampling$prior_family,
       target_interval = sampling$target_interval,
-      confounder_interval = sampling$confounder_interval
+      confounder_interval = sampling$confounder_interval,
+      expected_draw_count = expected_draw_count
     )
+    if (is_mcmc) {
+      summarized$diagnostics$chains_completed <- sampling$chains
+      summarized$diagnostics$chain_return_codes <- return_codes
+    }
     failure_stage <- "retrieve CmdStan output files"
     cmdstan_output_files <- fit$output_files()
     failure_stage <- "assemble compact result"
@@ -599,6 +627,7 @@ tf_stage1_screening_fit_one <- function(job, sampling) {
       target_tf_name = entry$target_tf,
       target_tf = summarized$target_tf,
       confounders = summarized$confounders,
+      target_screening_draws = summarized$target_screening_draws,
       stage2_parameter_draws = summarized$stage2_parameter_draws,
       control_level = entry$control_level,
       disease_level = entry$disease_level,
@@ -650,12 +679,16 @@ tf_stage1_screening_fit_one <- function(job, sampling) {
   })
 }
 
-#' Fit all ready Stage 1 screening models using four model-level workers.
+#' Fit ready gene models using a pool of model-level workers.
 #'
 #' The first level of the returned list is target gene. Each model entry keeps
 #' beta summaries for the target TF and all of its direct confounders, plus a
 #' compact set of aligned joint posterior draws for the EM Stage 2 interface.
 #' Full CmdStan fit objects and the remaining posterior draws are discarded.
+#' Each worker processes one gene at a time. Stage 2 runs its chains in parallel
+#' by default, while Stage 1 retains one concurrent chain per model. `cores`
+#' controls the number of gene workers, so simultaneous chain processes can
+#' reach `cores * parallel_chains`.
 run_TF_stage1_screening_regressions <- function(
   screening_input,
   cores = 4L,
@@ -676,29 +709,23 @@ run_TF_stage1_screening_regressions <- function(
   force_refit = FALSE,
   force_recompile = FALSE,
   inference = c("mcmc", "variational"),
-  prior_family = c("normal", "laplace"),
+  prior_family = "laplace",
   target_interval = 0.90,
   confounder_interval = 0.90,
   variational_algorithm = c("meanfield", "fullrank"),
   variational_iter = 10000L,
   variational_output_samples = 2000L,
   stage2_draw_count = 50L,
-  max_genes = NULL
+  max_genes = NULL,
+  parallel_chains = NULL
 ) {
   tf_stage1_screening_require_pkg("cmdstanr")
-  prior_family <- match.arg(
-    as.character(prior_family[[1]]),
-    c("normal", "laplace")
-  )
-  if (identical(prior_family, "normal") &&
-      !identical(attr(screening_input, "pipeline_stage"), "mcmc_input")) {
+  if (!identical(as.character(prior_family[[1]]), "laplace")) {
     tf_stage1_screening_stop(
-      paste0(
-        "Normal-prior Stage 2 requires the output of ",
-        "`build_TF_mcmc_input_from_prescreen()`."
-      )
+      "Stage 1 and Stage 2 require the knowledge Laplace prior; rebuild obsolete Normal-prior inputs."
     )
   }
+  prior_family <- "laplace"
   ready_genes <- tf_stage1_screening_validate_input(screening_input)
   if (!is.null(max_genes)) {
     max_genes <- suppressWarnings(as.integer(max_genes[[1]]))
@@ -721,6 +748,14 @@ run_TF_stage1_screening_regressions <- function(
   refresh <- suppressWarnings(as.integer(refresh[[1]]))
   max_treedepth <- suppressWarnings(as.integer(max_treedepth[[1]]))
   inference <- match.arg(as.character(inference[[1]]), c("mcmc", "variational"))
+  is_stage2 <- identical(attr(screening_input, "pipeline_stage"), "mcmc_input")
+  if (is_stage2 && !identical(inference, "mcmc")) {
+    tf_stage1_screening_stop("Stage 2 refinement requires MCMC inference.")
+  }
+  if (is.null(parallel_chains)) {
+    parallel_chains <- if (is_stage2) chains else 1L
+  }
+  parallel_chains <- suppressWarnings(as.integer(parallel_chains[[1]]))
   target_interval <- as.numeric(target_interval[[1]])
   confounder_interval <- as.numeric(confounder_interval[[1]])
   variational_algorithm <- match.arg(
@@ -737,6 +772,8 @@ run_TF_stage1_screening_regressions <- function(
   checkpoint_count <- suppressWarnings(as.integer(checkpoint_count[[1]]))
   retry_seed_offset <- suppressWarnings(as.integer(retry_seed_offset[[1]]))
   if (is.na(cores) || cores < 1L || is.na(chains) ||
+      is.na(parallel_chains) || parallel_chains < 1L ||
+      (identical(inference, "mcmc") && parallel_chains > chains) ||
       (identical(inference, "mcmc") && chains < 2L) ||
       is.na(iter_warmup) || iter_warmup < 0L ||
       is.na(iter_sampling) || iter_sampling < 1L ||
@@ -751,17 +788,17 @@ run_TF_stage1_screening_regressions <- function(
       is.na(retry_seed_offset) || retry_seed_offset < 0L) {
     tf_stage1_screening_stop("Invalid parallel or sampling configuration.")
   }
-  supported_intervals <- c(0.90, 0.95)
-  if (!any(abs(target_interval - supported_intervals) < 1e-12) ||
-      !any(abs(confounder_interval - supported_intervals) < 1e-12)) {
+  if (!is.finite(target_interval) || target_interval <= 0 || target_interval >= 1 ||
+      !is.finite(confounder_interval) || confounder_interval <= 0 || confounder_interval >= 1) {
     tf_stage1_screening_stop(
-      "`target_interval` and `confounder_interval` must be 0.90 or 0.95."
+      "`target_interval` and `confounder_interval` must be strictly between 0 and 1."
     )
   }
   worker_count <- min(cores, length(ready_genes))
   sampling <- list(
     inference = inference,
     chains = chains,
+    parallel_chains = parallel_chains,
     iter_warmup = iter_warmup,
     iter_sampling = iter_sampling,
     seed = seed,
@@ -769,6 +806,7 @@ run_TF_stage1_screening_regressions <- function(
     adapt_delta = as.numeric(adapt_delta),
     max_treedepth = max_treedepth,
     prior_family = prior_family,
+    is_stage2 = is_stage2,
     target_interval = target_interval,
     confounder_interval = confounder_interval,
     variational_algorithm = variational_algorithm,
@@ -848,6 +886,25 @@ run_TF_stage1_screening_regressions <- function(
       prior_and_interval_settings_match &&
       stage2_draw_settings_match
   }
+  mark_incomplete_stage2_results <- function(result) {
+    if (!is_stage2) return(result)
+    expected_draw_count <- as.double(chains) * iter_sampling
+    for (gene in names(result)) {
+      entry <- result[[gene]]
+      if (!is.list(entry) || !identical(entry$status, "ok")) next
+      draw_count <- entry$diagnostics$posterior_draws
+      if (length(draw_count) != 1L || !is.numeric(draw_count) ||
+          !is.finite(draw_count) || draw_count != expected_draw_count) {
+        result[[gene]]$status <- "error"
+        result[[gene]]$stage2_parameter_draws <- NULL
+        result[[gene]]$error <- sprintf(
+          "Incomplete cached Stage 2 posterior: expected %d draws from all %d chains.",
+          expected_draw_count, chains
+        )
+      }
+    }
+    result
+  }
   has_error_result <- function(result) {
     any(vapply(
       result,
@@ -860,7 +917,7 @@ run_TF_stage1_screening_regressions <- function(
   if (!isTRUE(force_refit) && file.exists(output_file)) {
     candidate_existing <- readRDS(output_file)
     if (is_compatible_result(candidate_existing)) {
-      existing <- candidate_existing
+      existing <- mark_incomplete_stage2_results(candidate_existing)
       retry_genes <- names(existing)[vapply(
         existing,
         function(entry) is.list(entry) && identical(entry$status, "error"),
@@ -888,6 +945,7 @@ run_TF_stage1_screening_regressions <- function(
   if (isTRUE(resume) && !isTRUE(force_refit) && file.exists(checkpoint_file)) {
     checkpoint <- readRDS(checkpoint_file)
     if (is_compatible_result(checkpoint)) {
+      checkpoint <- mark_incomplete_stage2_results(checkpoint)
       reusable <- intersect(names(checkpoint), ready_genes)
       if (isTRUE(retry_errors)) {
         reusable <- reusable[vapply(
@@ -904,7 +962,7 @@ run_TF_stage1_screening_regressions <- function(
   completed <- !vapply(results, is.null, logical(1))
   pending_genes <- ready_genes[!completed]
   inference_description <- if (identical(inference, "mcmc")) {
-    sprintf("%d sequential chains per model", chains)
+    sprintf("%d chains per model, %d concurrent", chains, parallel_chains)
   } else {
     sprintf(
       "%s ADVI with %d output draws per model",
@@ -937,6 +995,7 @@ run_TF_stage1_screening_regressions <- function(
     attr(result, "confounder_interval") <- confounder_interval
     attr(result, "model_workers") <- worker_count
     attr(result, "chains_per_model") <- chains
+    attr(result, "parallel_chains_per_model") <- parallel_chains
     attr(result, "sampling") <- sampling
     attr(result, "input_ready_genes") <- ready_genes
     attr(result, "input_skipped_genes") <- skipped_genes
@@ -975,9 +1034,11 @@ run_TF_stage1_screening_regressions <- function(
         "worker_exe_file",
         ".tfregact_native_cmdstan_csv",
         "tf_stage1_screening_stop",
+        "tf_stage1_screening_quantile_interval",
         "tf_validate_shared_laplace_stage1_data",
         "tf_fit_shared_laplace_stage1",
         "tf_shared_stage2_stop",
+        "tf_stage2_knowledge_prior",
         "tf_shared_stage2_data_fields",
         "tf_validate_shared_stage2_data",
         "tf_fit_shared_stage2",

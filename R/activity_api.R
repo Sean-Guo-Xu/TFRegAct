@@ -42,6 +42,37 @@
 #' `output = FALSE` returns all results in memory and removes intermediate files.
 #' `output = TRUE` writes `<TF>_output` below the current working directory.
 #' A character `output` is used as the output directory directly.
+#' `cores` controls gene-model workers. In Stage 2 each worker fits one gene at
+#' a time, with `mcmc_parallel_chains` concurrent chains (three by default).
+#' Stage 3 defaults to one fit conditional on the Stage 2 nuisance posterior
+#' means. When Stage 2 draws are requested, workers divide the conditional
+#' fits and the cell-level score averages their posterior activity means.
+#' @param cores Number of gene-model workers. Each worker processes one gene at
+#'   a time. Each MCMC stage can launch up to `cores * mcmc_parallel_chains`
+#'   chains. Stage 3 can fit up to `cores` selected posterior draws at a time.
+#' @param prescreen_inference Stage 1 inference. `"variational"` (default)
+#'   uses mean-field ADVI. `"mcmc"` uses the same chain count and concurrency
+#'   as Stage 2, with separate per-chain iteration budgets.
+#' @param prescreen_mcmc_iter_warmup,prescreen_mcmc_iter_sampling Stage 1
+#'   warmup and retained iterations per MCMC chain. Each defaults to 200.
+#' @param mcmc_chains Number of MCMC chains per gene. Default three.
+#' @param mcmc_parallel_chains Concurrent MCMC chains per gene worker.
+#' @param mcmc_iter_warmup Discarded warmup iterations per Stage 2 chain.
+#' @param mcmc_iter_sampling Retained iterations per Stage 2 chain.
+#' @param nuisance_draw_count Default 0 uses Stage 2 nuisance posterior means
+#'   in one Stage 3 fit. A positive count selects that many joint Stage 2 draws
+#'   without replacement for separate conditional fits.
+#' @param em_iter_warmup Discarded joint beta/activity sweeps per Stage 3 fit.
+#'   Default 500.
+#' @param em_iter_sampling Retained joint beta/activity sweeps per Stage 3 fit.
+#'   Default 500.
+#' @param em_algorithm Stage 3 algorithm. `gibbs_ars` samples the joint
+#'   coefficient/activity posterior. `quadrature_em` uses conditional-MAP EM.
+#' @param prescreen_fallback_target_interval One-time Stage 1 target interval
+#'   used only if no target survives the requested interval. Defaults to 0.80
+#'   when the initial interval is above 0.80; otherwise disabled. NULL disables fallback.
+#' @param mcmc_fallback_target_interval Optional equivalent fallback for Stage 2.
+#'   Disabled by default. Confounder thresholds are never relaxed.
 TF_activity_computation <- function(
   target_tf = NULL,
   input = NULL,
@@ -79,24 +110,71 @@ TF_activity_computation <- function(
   prescreen_confounder_interval = 0.90,
   prescreen_variational_iter = 10000L,
   prescreen_output_samples = 2000L,
-  direction_effect = 0.2,
-  beta_sd_floor = 0.5,
-  stage1_sd_multiplier = 1.5,
+  direction_effect = NULL,
+  beta_sd_floor = NULL,
+  stage1_sd_multiplier = NULL,
   stage2_alpha_prior_sd = 1,
   mcmc_target_interval = 0.90,
   mcmc_confounder_interval = 0.90,
   mcmc_chains = 3L,
-  mcmc_iter_warmup = 400L,
-  mcmc_iter_sampling = 600L,
+  mcmc_iter_warmup = 500L,
+  mcmc_iter_sampling = 500L,
   mcmc_adapt_delta = 0.95,
   mcmc_max_treedepth = 12L,
-  nuisance_draw_count = 100L,
+  nuisance_draw_count = 0L,
   active_prior_zero = 0.2,
   em_control = list(),
   resume = TRUE,
   force_refit = FALSE,
-  force_recompile = FALSE
+  force_recompile = FALSE,
+  mcmc_parallel_chains = mcmc_chains,
+  em_iter_warmup = 500L,
+  em_iter_sampling = 500L,
+  em_algorithm = c("gibbs_ars", "quadrature_em"),
+  prescreen_fallback_target_interval = if (prescreen_target_interval > 0.80) 0.80 else NULL,
+  mcmc_fallback_target_interval = NULL,
+  prescreen_inference = c("variational", "mcmc"),
+  prescreen_mcmc_iter_warmup = 200L,
+  prescreen_mcmc_iter_sampling = 200L
 ) {
+  em_algorithm <- match.arg(em_algorithm)
+  prescreen_inference <- match.arg(prescreen_inference)
+  counts <- list(mcmc_iter_warmup = mcmc_iter_warmup, mcmc_iter_sampling = mcmc_iter_sampling,
+                 prescreen_mcmc_iter_warmup = prescreen_mcmc_iter_warmup,
+                 prescreen_mcmc_iter_sampling = prescreen_mcmc_iter_sampling,
+                 em_iter_warmup = em_iter_warmup, em_iter_sampling = em_iter_sampling,
+                 mcmc_chains = mcmc_chains, mcmc_parallel_chains = mcmc_parallel_chains)
+  for (name in names(counts)) {
+    value <- counts[[name]]
+    minimum <- if (grepl("warmup$", name)) 0 else {
+      if (name %in% c("mcmc_chains", "em_iter_sampling")) 2 else 1
+    }
+    if (!is.numeric(value) || length(value) != 1L || !is.finite(value) ||
+        value < minimum || value != floor(value) || value > .Machine$integer.max) {
+      .tf_activity_computation_stop("`%s` must be a whole number at least %d.", name, minimum)
+    }
+  }
+  if (mcmc_parallel_chains > mcmc_chains) {
+    .tf_activity_computation_stop("`mcmc_parallel_chains` cannot exceed `mcmc_chains`.")
+  }
+  if (as.double(em_iter_warmup) + as.double(em_iter_sampling) > .Machine$integer.max) {
+    .tf_activity_computation_stop("Combined Stage 3 warmup and sampling counts exceed the supported integer range.")
+  }
+  for (pair in list(c("prescreen_target_interval", "prescreen_fallback_target_interval"),
+                    c("mcmc_target_interval", "mcmc_fallback_target_interval"))) {
+    requested <- get(pair[[1]])
+    if (!is.numeric(requested) || length(requested) != 1L || !is.finite(requested) ||
+        requested <= 0 || requested >= 1) {
+      .tf_activity_computation_stop("`%s` must be a finite number strictly between 0 and 1.", pair[[1]])
+    }
+    fallback <- get(pair[[2]])
+    if (!is.null(fallback) && (!is.numeric(fallback) || length(fallback) != 1L ||
+        !is.finite(fallback) || fallback <= 0 || fallback >= requested)) {
+      .tf_activity_computation_stop("`%s` must be NULL or a positive number below `%s`.", pair[[2]], pair[[1]])
+    }
+  }
+  tf_stage2_warn_legacy_prior_arguments(direction_effect, beta_sd_floor, stage1_sd_multiplier)
+  direction_effect <- beta_sd_floor <- stage1_sd_multiplier <- NULL
   .tf_activity_computation_load_dependencies()
   if (!is.null(max_adjustment_sets)) {
     warning(
@@ -149,7 +227,25 @@ TF_activity_computation <- function(
   input_build_elapsed_seconds <- as.numeric(difftime(Sys.time(), input_build_started, units = "secs"))
 
   pipeline_started <- Sys.time()
-  pipeline_result <- run_TF_three_stage_pipeline(screening_input = screening_input, output_dir = work_dir, cores = cores, seed = seed, prescreen_target_interval = prescreen_target_interval, prescreen_confounder_interval = prescreen_confounder_interval, prescreen_variational_iter = prescreen_variational_iter, prescreen_output_samples = prescreen_output_samples, direction_effect = direction_effect, beta_sd_floor = beta_sd_floor, stage1_sd_multiplier = stage1_sd_multiplier, stage2_alpha_prior_sd = stage2_alpha_prior_sd, mcmc_target_interval = mcmc_target_interval, mcmc_confounder_interval = mcmc_confounder_interval, mcmc_chains = mcmc_chains, mcmc_iter_warmup = mcmc_iter_warmup, mcmc_iter_sampling = mcmc_iter_sampling, mcmc_adapt_delta = mcmc_adapt_delta, mcmc_max_treedepth = mcmc_max_treedepth, nuisance_draw_count = nuisance_draw_count, active_prior_zero = active_prior_zero, em_control = em_control, resume = resume, force_refit = force_refit, force_recompile = force_recompile)
+  pipeline_result <- run_TF_three_stage_pipeline(
+    screening_input = screening_input, output_dir = work_dir, cores = cores, seed = seed,
+    prescreen_target_interval = prescreen_target_interval,
+    prescreen_confounder_interval = prescreen_confounder_interval,
+    prescreen_variational_iter = prescreen_variational_iter, prescreen_output_samples = prescreen_output_samples,
+    prescreen_inference = prescreen_inference,
+    prescreen_mcmc_iter_warmup = prescreen_mcmc_iter_warmup,
+    prescreen_mcmc_iter_sampling = prescreen_mcmc_iter_sampling,
+    direction_effect = direction_effect, beta_sd_floor = beta_sd_floor, stage1_sd_multiplier = stage1_sd_multiplier,
+    stage2_alpha_prior_sd = stage2_alpha_prior_sd, mcmc_target_interval = mcmc_target_interval,
+    mcmc_confounder_interval = mcmc_confounder_interval, mcmc_chains = mcmc_chains,
+    mcmc_iter_warmup = mcmc_iter_warmup, mcmc_iter_sampling = mcmc_iter_sampling,
+    mcmc_parallel_chains = mcmc_parallel_chains,
+    mcmc_adapt_delta = mcmc_adapt_delta, mcmc_max_treedepth = mcmc_max_treedepth,
+    nuisance_draw_count = nuisance_draw_count, active_prior_zero = active_prior_zero,
+    em_iter_warmup = em_iter_warmup, em_iter_sampling = em_iter_sampling, em_algorithm = em_algorithm,
+    prescreen_fallback_target_interval = prescreen_fallback_target_interval,
+    mcmc_fallback_target_interval = mcmc_fallback_target_interval,
+    em_control = em_control, resume = resume, force_refit = force_refit, force_recompile = force_recompile)
   pipeline_elapsed_seconds <- as.numeric(difftime(Sys.time(), pipeline_started, units = "secs"))
 
   activity_column <- paste0(target_tf, "_activity_A")

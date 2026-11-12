@@ -93,9 +93,9 @@ TF_regulatory_direction_computation <- function(
   correlation_filter = TRUE,
   correlation_threshold = 0.7,
   stage2_model = c("no_interaction", "target_interaction"),
-  direction_effect = 0.2,
-  beta_sd_floor = 0.5,
-  stage1_sd_multiplier = 1.5,
+  direction_effect = NULL,
+  beta_sd_floor = NULL,
+  stage1_sd_multiplier = NULL,
   target_interaction_sd = 0.5,
   stage2_chains = 3L,
   stage2_iter_warmup = 500L,
@@ -117,6 +117,8 @@ TF_regulatory_direction_computation <- function(
   stage2_model <- match.arg(stage2_model)
   stage1_inference <- match.arg(stage1_inference)
   stage1_variational_algorithm <- match.arg(stage1_variational_algorithm)
+  tf_stage2_warn_legacy_prior_arguments(direction_effect, beta_sd_floor, stage1_sd_multiplier)
+  direction_effect <- beta_sd_floor <- stage1_sd_multiplier <- NULL
   if (!is.null(max_adjustment_sets)) {
     warning(
       "`max_adjustment_sets` is obsolete and ignored; minimum-cut search returns one minimum-cardinality set.",

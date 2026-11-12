@@ -30,13 +30,25 @@ stopifnot(!anyNA(source_index), all(is.finite(obj$EP300_activity_smooth)),
   isTRUE(all.equal(obj$EP300_activity_smooth, source_data$smoothed[source_index], check.attributes = FALSE)),
   isTRUE(all.equal(obj$EP300_activity_A, source_data$original[source_index], check.attributes = FALSE)))
 expected <- read.csv('docs/figures/ep300-cell-level-ttests.csv')
-stopifnot(isTRUE(all.equal(test$p.value, expected$p[expected$method == 'KNN-smoothed'], tolerance = 1e-12)))
-box_stats <- ggplot_build(p_box)$data[[1]]
-for (group in 1:2) {
-  values <- md$EP300_activity_smooth[md$sample == c('Normal', 'AAA')[group]]
-  row <- box_stats[box_stats$group == group, ]
-  stopifnot(isTRUE(all.equal(as.numeric(row[1, c('lower', 'middle', 'upper')]),
-                            as.numeric(quantile(values, c(.25, .5, .75))), tolerance = 1e-12)))
+expected_p <- expected$p[match(c('Original', 'KNN-smoothed'), expected$method)]
+observed_p <- unname(vapply(tests, function(test) test$p.value, numeric(1)))
+stopifnot(isTRUE(all.equal(observed_p, expected_p, tolerance = 1e-12)))
+feature_build <- ggplot_build(p_feature)
+box_build <- ggplot_build(p_box)
+stopifnot(all(table(feature_data$smoothing) == ncol(obj)),
+  length(unique(feature_build$layout$layout$SCALE_X)) == 1L,
+  length(unique(feature_build$layout$layout$SCALE_Y)) == 1L,
+  length(unique(box_build$layout$layout$SCALE_Y)) == 1L)
+box_stats <- box_build$data[[1]]
+for (panel in seq_along(panel_order)) {
+  for (group in 1:2) {
+    values <- box_data$Activity[box_data$smoothing == panel_order[panel] &
+      box_data$sample == levels(box_data$sample)[group]]
+    row <- box_stats[as.integer(box_stats$PANEL) == panel & box_stats$group == group, ]
+    stopifnot(nrow(row) == 1L,
+      isTRUE(all.equal(as.numeric(row[1, c('lower', 'middle', 'upper')]),
+                       as.numeric(quantile(values, c(.25, .5, .75))), tolerance = 1e-12)))
+  }
 }
 
 export <- function(p, name, width, height) {
@@ -47,13 +59,13 @@ export <- function(p, name, width, height) {
   svglite::svglite(paste0(prefix, '.svg'), width = width, height = height)
   print(p); dev.off()
 }
-export(p_feature, 'smoothing-featureplot', 6, 5.4)
-export(p_box, 'ep300-cell-level-boxplot', 5, 5)
-writeLines(c('Exact README examples executed on all 14627 macrophages; no sampling or score clipping.',
-  'Smoothing scores and cell-level p-values match the previous saved results.',
-  'Both box quartiles verified on the untransformed scores.',
-  'FeaturePlot uses a linear colour scale; original UMAP coordinates retained.',
-  'Cell-level Welch tests are exploratory; cells within samples and smoothed scores are dependent.',
-  'R only; 600-dpi PNG and editable PDF/SVG; centered titles and no captions.'),
+export(p_feature, 'smoothing-featureplot', 8, 4.5)
+export(p_box, 'ep300-boxplot-before-after', 8, 4.6)
+writeLines(c('The README examples use all 14627 macrophages without sampling or score clipping.',
+  'Original and smoothed scores and both cell-level p-values match the saved source data.',
+  'Boxplot quartiles verified on the untransformed scores. Panels share a linear y-axis.',
+  'UMAP panels retain the same coordinates and share a linear colour scale.',
+  'Cell-level Welch tests are exploratory because cells within samples and smoothed scores are dependent.',
+  'R exports include 600-dpi PNG and editable PDF/SVG.'),
   'docs/figures/smoothing-QA.txt')
-print(test)
+print(tests)

@@ -29,14 +29,19 @@ a <- ns$create_TF_analysis_object(x, batch = NULL, sample = obj$group,
   target = c('T','Y'), libsize = colSums(counts), confidence = c(4,5),
   direction = c('activation','unknown'), Y_exp = counts['Y',])
 draws <- matrix(rnorm(200), 100, dimnames = list(NULL,c('beta[1]','beta[2]')))
-fake <- list(fit = list(draws = function(...) draws), feature_names = c('T','V'))
-d <- ns$tf_prepare_stage2_stan_data(a, fake, 0.2, 0.5, 1.5, 'Normal','AAA',1,10,
+stage1_data <- ns$tf_prepare_stan_data(a, 1.8, 0.7, 4, 1, 10, 'Normal', 'AAA')
+fake <- list(fit = list(draws = function(...) draws), feature_names = c('T','V'),
+  stan_data = stage1_data)
+d <- ns$tf_prepare_stage2_stan_data(a, fake, NULL, NULL, NULL, 'Normal','AAA',1,10,
   target_interaction = TRUE)
 design <- ns$tf_hierarchical_sample_design(d, obj[[]], 'donor')
 shuffled <- ns$tf_hierarchical_sample_design(d, obj[[]][40:1,], 'donor')
 stopifnot(identical(design, shuffled), design$S == 4L,
-  identical(d$X, t(x)), isTRUE(all.equal(d$beta_prior_mean[1], mean(draws[,1]) + 0.2)),
-  isTRUE(all.equal(d$beta_prior_sd, pmax(0.5, 1.5 * apply(draws, 2, sd)), check.attributes = FALSE)))
+  identical(d$X, t(x)), identical(d$confidence, stage1_data$confidence),
+  identical(d$direction, as.integer(stage1_data$direction)), d$gamma == 1.8,
+  d$eta == 0.7, d$r_dir == 4,
+  isTRUE(all.equal(d$beta_init, unname(colMeans(draws)))),
+  is.null(d$beta_prior_mean), is.null(d$beta_prior_sd))
 expect_error(ns$tf_hierarchical_sample_design(d, obj[[]], NULL), 'requires')
 bad <- obj[[]]; bad$donor[21] <- 's1'
 expect_error(ns$tf_hierarchical_sample_design(d, bad, 'donor'), 'multiple conditions')
@@ -79,4 +84,4 @@ for (type in c('single_cell','bulk')) for (condition in c(FALSE,TRUE)) {
   }
 }
 expect_error(pipeline(input = input, data_type = 'bulk'), 'disagrees')
-cat('PASS: all routes, explicit input types, sample alignment, replicate and variation guards, Stage 2 prior transfer.\n')
+cat('PASS: all routes, sample alignment, replicate guards, and original Stage 1 knowledge priors.\n')

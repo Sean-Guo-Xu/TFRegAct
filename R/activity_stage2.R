@@ -10,8 +10,8 @@ tf_em_stage2_input_stop <- function(...) {
 #' each retained joint posterior draw, eta0 contains the intercept, condition,
 #' batch, offset, and every confounder contribution, but deliberately excludes
 #' the target-TF main effect and target-TF-by-condition interaction. The EM
-#' M-step uses the posterior-informed Normal prior originally supplied to Stage
-#' 2, while the target-TF expression is replaced by latent activity A.
+#' M-step uses the original knowledge Laplace prior also supplied to Stage 2,
+#' while the target-TF expression is replaced by latent activity A.
 build_TF_EM_stage2_input <- function(
   stage1_filtered_results,
   stage1_screening_input,
@@ -140,10 +140,11 @@ build_TF_EM_stage2_input <- function(
   )
   beta_target_mean_init <- beta_target_delta_init <-
     beta_target_control_init <- beta_target_disease_init <-
-      beta_prior_mean <- beta_prior_sd <- target_interaction_sd <-
+      beta_lambda_positive <- beta_lambda_negative <- target_interaction_sd <-
         stats::setNames(rep(NA_real_, G), target_genes)
   source_draw_index <- setNames(vector("list", G), target_genes)
   confounders <- setNames(vector("list", G), target_genes)
+  knowledge_priors <- setNames(vector("list", G), target_genes)
 
   for (g in seq_along(target_genes)) {
     gene <- target_genes[[g]]
@@ -154,8 +155,9 @@ build_TF_EM_stage2_input <- function(
       tf_em_stage2_input_stop("Stage 1 input `%s` is not ready.", gene)
     }
     if (!identical(draws$interface_version,
-                   "tf_em_stage2_parameter_draws_v1") ||
-        !identical(draws$prior_family, "normal") ||
+                   "tf_em_stage2_parameter_draws_v2") ||
+        !identical(draws$prior_family, "laplace") ||
+        !identical(draws$beta_prior_family, "laplace") ||
         !identical(as.integer(draws$draw_count), source_draw_count)) {
       tf_em_stage2_input_stop(
         "Gene `%s` has an incompatible Stage 2 draw interface or draw count.",
@@ -182,6 +184,19 @@ build_TF_EM_stage2_input <- function(
 
     feature_names <- as.character(input$feature_names)
     target_index <- as.integer(input$target_tf_index)
+    expected_prior <- tf_stage2_knowledge_prior(input$stan_data)
+    if (!identical(names(draws$beta_lambda_positive), feature_names) ||
+        !identical(names(draws$beta_lambda_negative), feature_names) ||
+        !isTRUE(all.equal(as.numeric(draws$beta_lambda_positive),
+                          as.numeric(expected_prior$beta_lambda_positive),
+                          tolerance = 1e-12, check.attributes = FALSE)) ||
+        !isTRUE(all.equal(as.numeric(draws$beta_lambda_negative),
+                          as.numeric(expected_prior$beta_lambda_negative),
+                          tolerance = 1e-12, check.attributes = FALSE))) {
+      tf_em_stage2_input_stop(
+        "Knowledge Laplace prior metadata differ from the Stage 2 input for `%s`.", gene
+      )
+    }
     if (!identical(colnames(draws$beta), feature_names) ||
         nrow(draws$beta) != source_draw_count ||
         ncol(draws$beta) != length(feature_names) ||
@@ -302,8 +317,9 @@ build_TF_EM_stage2_input <- function(
     } else {
       target_row$beta_mean[[1]]
     }
-    beta_prior_mean[[g]] <- draws$beta_prior_mean[[target_name]]
-    beta_prior_sd[[g]] <- draws$beta_prior_sd[[target_name]]
+    beta_lambda_positive[[g]] <- draws$beta_lambda_positive[[target_name]]
+    beta_lambda_negative[[g]] <- draws$beta_lambda_negative[[target_name]]
+    knowledge_priors[[g]] <- expected_prior
     target_interaction_sd[[g]] <- draws$target_interaction_sd
     source_draw_index[[g]] <- if (identical(nuisance_storage, "posterior_mean")) {
       0L
@@ -326,7 +342,7 @@ build_TF_EM_stage2_input <- function(
   }
 
   result <- list(
-    interface_version = "tf_em_stage2_input_v3",
+    interface_version = "tf_em_stage2_input_v4",
     pipeline_stage = "em_input",
     model_version = expected_model_version,
     target_tf = first_input$target_tf,
@@ -353,8 +369,10 @@ build_TF_EM_stage2_input <- function(
     beta_target_delta_init = beta_target_delta_init,
     beta_target_control_init = beta_target_control_init,
     beta_target_disease_init = beta_target_disease_init,
-    beta_prior_mean = beta_prior_mean,
-    beta_prior_sd = beta_prior_sd,
+    beta_prior_family = "laplace",
+    beta_lambda_positive = beta_lambda_positive,
+    beta_lambda_negative = beta_lambda_negative,
+    knowledge_priors = knowledge_priors,
     target_interaction_sd = target_interaction_sd,
     source_draw_index = source_draw_index,
     confounders = confounders,

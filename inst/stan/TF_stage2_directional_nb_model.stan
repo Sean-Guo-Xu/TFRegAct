@@ -16,8 +16,11 @@ data {
   matrix[K_batch, Q] batch_level_design;
 
   vector[N] log_offset;
-  vector[P] beta_prior_mean;
-  vector<lower=0>[P] beta_prior_sd;
+  vector<lower=0>[P] confidence;
+  array[P] int<lower=-1, upper=1> direction;
+  real<lower=0> gamma;
+  real<lower=0> eta;
+  real<lower=1> r_dir;
   real<lower=0> alpha_prior_sd;
 
   int<lower=1, upper=P> target_tf_index;
@@ -72,7 +75,17 @@ model {
     zeta ~ normal(rep_vector(0, Q), W_prior_scale);
   }
   log_phi ~ normal(0, 1);
-  beta ~ normal(beta_prior_mean, beta_prior_sd);
+  // Reuse the original Stage 1 knowledge prior, not its fitted posterior.
+  for (j in 1:P) {
+    real b_j = pow(fmax(confidence[j], 1.0) / 10.0, eta) * gamma;
+    real lambda_fav = 1.0 / b_j;
+    real lambda_opp = direction[j] == 0 ? lambda_fav : r_dir * lambda_fav;
+    real lambda_pos = direction[j] == -1 ? lambda_opp : lambda_fav;
+    real lambda_neg = direction[j] == 1 ? lambda_opp : lambda_fav;
+    target += log(lambda_pos) + log(lambda_neg) - log(lambda_pos + lambda_neg);
+    if (beta[j] >= 0) target += -lambda_pos * beta[j];
+    else target += lambda_neg * beta[j];
+  }
   if (use_target_interaction == 1) {
     beta_target_delta_free[1] ~ normal(0, target_interaction_sd);
   }

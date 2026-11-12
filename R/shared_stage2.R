@@ -3,42 +3,60 @@ tf_shared_stage2_stop <- function(...) {
 }
 
 tf_shared_stage2_model_version <- function() {
-  "stage1_laplace_stage2_shared_empirical_bayes_v6"
+  "stage1_stage2_shared_knowledge_laplace_v7"
 }
 
-tf_stage2_prior_from_stage1 <- function(
-  stage1_beta_mean,
-  stage1_beta_sd,
-  direction,
-  direction_effect = 0.2,
-  beta_sd_floor = 0.5,
-  stage1_sd_multiplier = 1.5
+tf_stage2_warn_legacy_prior_arguments <- function(
+  direction_effect = NULL, beta_sd_floor = NULL, stage1_sd_multiplier = NULL
 ) {
-  stage1_beta_mean <- as.numeric(stage1_beta_mean)
-  stage1_beta_sd <- as.numeric(stage1_beta_sd)
-  direction <- as.integer(direction)
-  P <- length(stage1_beta_mean)
-  if (P < 1L || length(stage1_beta_sd) != P || length(direction) != P ||
-      any(!is.finite(stage1_beta_mean)) || any(!is.finite(stage1_beta_sd)) ||
-      any(stage1_beta_sd < 0) || any(!direction %in% c(-1L, 0L, 1L))) {
-    tf_shared_stage2_stop("Invalid Stage 1 beta summary or direction vector.")
+  supplied <- c(direction_effect = !is.null(direction_effect),
+    beta_sd_floor = !is.null(beta_sd_floor),
+    stage1_sd_multiplier = !is.null(stage1_sd_multiplier))
+  if (any(supplied)) {
+    warning(paste0("`", paste(names(supplied)[supplied], collapse = "`, `"),
+      "` are deprecated and ignored; Stage 2 reuses the Stage 1 knowledge prior."),
+      call. = FALSE)
   }
-  hyperparameters <- c(direction_effect, beta_sd_floor, stage1_sd_multiplier)
-  if (any(!is.finite(hyperparameters)) || direction_effect < 0 ||
-      beta_sd_floor <= 0 || stage1_sd_multiplier <= 0) {
+  invisible(NULL)
+}
+
+# Describe the original network-informed prior; posterior moments are not inputs.
+tf_stage2_knowledge_prior <- function(stan_data) {
+  fields <- c("P", "confidence", "direction", "gamma", "eta", "r_dir")
+  missing <- setdiff(fields, names(stan_data))
+  if (length(missing)) {
+    tf_shared_stage2_stop("Stage 1 knowledge-prior metadata are missing: %s.",
+      paste(missing, collapse = ", "))
+  }
+  P <- stan_data$P
+  confidence <- as.numeric(stan_data$confidence)
+  direction <- stan_data$direction
+  hyperparameters <- unlist(stan_data[c("gamma", "eta", "r_dir")], use.names = FALSE)
+  if (length(P) != 1L || !is.finite(P) || P < 1L || P != as.integer(P) ||
+      length(confidence) != P || length(direction) != P ||
+      any(!is.finite(confidence)) || any(confidence < 0) ||
+      anyNA(direction) || any(!direction %in% c(-1L, 0L, 1L)) ||
+      any(lengths(stan_data[c("gamma", "eta", "r_dir")]) != 1L) ||
+      any(!is.finite(hyperparameters)) || stan_data$gamma <= 0 ||
+      stan_data$eta < 0 || stan_data$r_dir < 1) {
     tf_shared_stage2_stop(
-      "`direction_effect` must be nonnegative; prior SD floor and multiplier must be positive."
+      "Invalid confidence, direction or scale in the Stage 1 knowledge prior."
     )
   }
+  direction <- as.integer(direction)
+  scale <- stan_data$gamma * (pmax(confidence, 1) / 10) ^ stan_data$eta
+  lambda_fav <- 1 / scale
+  lambda_positive <- lambda_fav * ifelse(direction == -1L, stan_data$r_dir, 1)
+  lambda_negative <- lambda_fav * ifelse(direction == 1L, stan_data$r_dir, 1)
+  if (any(!is.finite(scale)) || any(scale <= 0) ||
+      any(!is.finite(lambda_positive)) || any(!is.finite(lambda_negative))) {
+    tf_shared_stage2_stop("Knowledge-prior scales and rates must be finite and positive.")
+  }
   list(
-    beta_prior_mean = stage1_beta_mean + direction_effect * direction,
-    beta_prior_sd = pmax(beta_sd_floor, stage1_sd_multiplier * stage1_beta_sd),
-    stage1_beta_mean = stage1_beta_mean,
-    stage1_beta_sd = stage1_beta_sd,
-    direction = direction,
-    direction_effect = as.numeric(direction_effect),
-    beta_sd_floor = as.numeric(beta_sd_floor),
-    stage1_sd_multiplier = as.numeric(stage1_sd_multiplier)
+    prior_family = "laplace", confidence = confidence, direction = as.integer(direction),
+    gamma = as.numeric(stan_data$gamma), eta = as.numeric(stan_data$eta),
+    r_dir = as.numeric(stan_data$r_dir), beta_prior_scale = scale,
+    beta_lambda_positive = lambda_positive, beta_lambda_negative = lambda_negative
   )
 }
 
@@ -47,7 +65,7 @@ tf_shared_stage2_data_fields <- function() {
     "N", "P", "Y", "X", "Q", "W", "W_prior_scale",
     "has_condition", "condition_w_index", "condition",
     "K_batch", "batch", "batch_level_design", "log_offset",
-    "beta_prior_mean", "beta_prior_sd", "alpha_prior_sd",
+    "confidence", "direction", "gamma", "eta", "r_dir", "alpha_prior_sd",
     "target_tf_index", "use_target_interaction",
     "target_condition_centered", "target_interaction_sd"
   )
@@ -73,14 +91,10 @@ tf_validate_shared_stage2_data <- function(stan_data) {
       nrow(stan_data$batch_level_design) != K_batch ||
       ncol(stan_data$batch_level_design) != Q ||
       length(stan_data$log_offset) != N ||
-      length(stan_data$beta_prior_mean) != P ||
-      length(stan_data$beta_prior_sd) != P ||
-      any(!is.finite(stan_data$beta_prior_mean)) ||
-      any(!is.finite(stan_data$beta_prior_sd)) ||
-      any(stan_data$beta_prior_sd <= 0) ||
       !is.finite(stan_data$alpha_prior_sd) || stan_data$alpha_prior_sd <= 0) {
     tf_shared_stage2_stop("Shared Stage 2 data have inconsistent dimensions or priors.")
   }
+  tf_stage2_knowledge_prior(stan_data)
   has_condition <- as.integer(stan_data$has_condition)
   use_interaction <- as.integer(stan_data$use_target_interaction)
   if (!has_condition %in% 0:1 || !use_interaction %in% 0:1 ||
@@ -124,7 +138,7 @@ tf_fit_shared_stage2 <- function(
   tf_validate_shared_stage2_data(stan_data)
   data_for_stan <- stan_data[tf_shared_stage2_data_fields()]
   beta_init <- if (is.null(stan_data$beta_init)) {
-    as.numeric(data_for_stan$beta_prior_mean)
+    rep(0, data_for_stan$P)
   } else {
     as.numeric(stan_data$beta_init)
   }

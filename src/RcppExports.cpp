@@ -10,6 +10,20 @@ Rcpp::Rostream<true>&  Rcpp::Rcout = Rcpp::Rcpp_cout_get();
 Rcpp::Rostream<false>& Rcpp::Rcerr = Rcpp::Rcpp_cerr_get();
 #endif
 
+// tf_activity_gibbs_ars_cpp
+Rcpp::List tf_activity_gibbs_ars_cpp(Rcpp::List common, Rcpp::NumericMatrix eta0, Rcpp::NumericVector phi, Rcpp::List settings);
+RcppExport SEXP _TFRegAct_tf_activity_gibbs_ars_cpp(SEXP commonSEXP, SEXP eta0SEXP, SEXP phiSEXP, SEXP settingsSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< Rcpp::List >::type common(commonSEXP);
+    Rcpp::traits::input_parameter< Rcpp::NumericMatrix >::type eta0(eta0SEXP);
+    Rcpp::traits::input_parameter< Rcpp::NumericVector >::type phi(phiSEXP);
+    Rcpp::traits::input_parameter< Rcpp::List >::type settings(settingsSEXP);
+    rcpp_result_gen = Rcpp::wrap(tf_activity_gibbs_ars_cpp(common, eta0, phi, settings));
+    return rcpp_result_gen;
+END_RCPP
+}
 // recursive_bayes_ball_cpp
 bool recursive_bayes_ball_cpp(Rcpp::List parents, Rcpp::List children, int exposure_index, int outcome_index, Rcpp::IntegerVector blocked_nodes);
 RcppExport SEXP _TFRegAct_recursive_bayes_ball_cpp(SEXP parentsSEXP, SEXP childrenSEXP, SEXP exposure_indexSEXP, SEXP outcome_indexSEXP, SEXP blocked_nodesSEXP) {
@@ -27,6 +41,7 @@ END_RCPP
 }
 
 static const R_CallMethodDef CallEntries[] = {
+    {"_TFRegAct_tf_activity_gibbs_ars_cpp", (DL_FUNC) &_TFRegAct_tf_activity_gibbs_ars_cpp, 4},
     {"_TFRegAct_recursive_bayes_ball_cpp", (DL_FUNC) &_TFRegAct_recursive_bayes_ball_cpp, 5},
     {NULL, NULL, 0}
 };

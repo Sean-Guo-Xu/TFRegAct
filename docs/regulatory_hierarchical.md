@@ -61,26 +61,36 @@ The condition main effect and optional batch contrasts remain in W. Random
 intercepts and slopes use noncentered parameterization, with a shared slope SD
 across conditions. Only the focal TF receives a random slope.
 
-The coefficient prior follows the existing Stage 2 transfer:
+The coefficient prior is the same confidence-weighted directional Laplace prior
+used in Stage 1, restricted to the retained predictors:
 
 ```text
-beta_prior_mean[j] = stage1_mean[j] + direction_effect * direction[j]
-beta_prior_sd[j]   = max(beta_sd_floor, stage1_sd_multiplier * stage1_sd[j])
-beta[j] ~ Normal(beta_prior_mean[j], beta_prior_sd[j])
+scale[j] = gamma * (max(confidence[j], 1) / 10)^eta
+log p(beta[j]) = constant - abs(beta[j]) / scale[j] *
+                (1 + (r_dir - 1) * I(direction[j] * beta[j] < 0))
 ```
 
-Defaults are 0.2, 0.5 and 1.5, respectively; the default delta SD is 0.5 and
-both random-effect SD scales are 1. Network confidence acts through Stage 1.
-The earlier experimental `TF_stage1_hierarchical_nb_model.stan` used a Laplace
-prior directly and remains an experimental reference. The production model
-is `TF_stage2_hierarchical_nb_model.stan` with posterior-informed Normal priors.
+Defaults are `gamma = 1`, `eta = 0.5` and `r_dir = 3`; the default delta SD is
+0.5 and both random-effect SD scales are 1. Stage 1 posterior summaries are used
+for screening and initialization, not as Stage 2 prior parameters. The original
+network confidence and direction determine the prior once in each refit.
+The production model is `TF_stage2_hierarchical_nb_model.stan`.
+`TF_stage1_hierarchical_nb_model.stan` remains an experimental reference.
 
-Stage 1 uses uncentered expression while the hierarchy estimates within-sample
-slopes. Transferred moments therefore provide empirical-Bayes regularization,
-not an exact posterior transfer for an identical estimand. Reuse of the same
-data across stages remains empirical Bayes. Centering does not change predictor
-units; condition slopes should not be multiplied by uncentered group mean
-expression and called a hierarchical total regulatory contrast.
+Stage 1 uses expression that has not been centered within biological sample,
+whereas the hierarchy estimates within-sample slopes. These are different
+estimands on the same predictor units; Stage 2 uses the original network prior
+on that scale, rather than transferring a Stage 1 posterior for a different
+estimand. The same expression observations are refitted after screening; this
+is not a sequential update with an independent second dataset. Centering does
+not change predictor units; condition slopes should not be multiplied by
+uncentered group mean expression and called a hierarchical total regulatory
+contrast.
+
+The old `direction_effect`, `beta_sd_floor` and `stage1_sd_multiplier`
+arguments default to `NULL` and are deprecated: non-`NULL` values are ignored
+with a warning. Saved Stage 2 fits from the earlier posterior-informed Normal
+prior version must be refitted before interpretation under the current model.
 
 ## Validation and outputs
 

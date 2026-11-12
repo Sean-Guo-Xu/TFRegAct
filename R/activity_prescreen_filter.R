@@ -11,15 +11,33 @@ filter_TF_prescreen_results <- function(
   prescreen_results,
   target_interval = 0.90,
   confounder_interval = 0.90,
-  output_file = NULL
+  output_file = NULL,
+  fallback_target_interval = NULL
+) {
+  filtered <- tf_screening_filter_with_fallback(
+    prescreen_results, target_interval, fallback_target_interval,
+    function(models, interval) tf_prescreen_filter_once(models, interval, confounder_interval)
+  )
+  if (!is.null(output_file)) {
+    output_file <- normalizePath(output_file, winslash = "/", mustWork = FALSE)
+    dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
+    attr(filtered, "output_file") <- output_file
+    saveRDS(filtered, output_file)
+  }
+  filtered
+}
+
+tf_prescreen_filter_once <- function(
+  prescreen_results, target_interval, confounder_interval
 ) {
   if (!is.list(prescreen_results) || !length(prescreen_results)) {
     tf_prescreen_stop("`prescreen_results` must be a non-empty result list.")
   }
-  if (!identical(attr(prescreen_results, "inference"), "variational") ||
+  if (!isTRUE(attr(prescreen_results, "inference") %in% c("variational", "mcmc")) ||
+      identical(attr(prescreen_results, "input_pipeline_stage"), "mcmc_input") ||
       !identical(attr(prescreen_results, "prior_family"), "laplace")) {
     tf_prescreen_stop(
-      "Stage 1 prescreening requires variational inference with a Laplace prior."
+      "Expected Stage 1 variational or MCMC results fitted with a Laplace prior."
     )
   }
 
@@ -32,7 +50,7 @@ filter_TF_prescreen_results <- function(
     model <- prescreen_results[[i]]
     if (!is.list(model) || !identical(model$status, "ok") ||
         nrow(model$target_tf) != 1L) {
-      # A single VI failure (commonly a near-all-zero response gene) must not
+      # A single model failure must not
       # abort screening for every other downstream target.  Preserve its
       # reason in the audit table and exclude it from Stage 2.
       summary_rows[[i]] <- data.frame(
@@ -222,12 +240,6 @@ filter_TF_prescreen_results <- function(
   attr(filtered, "filter_summary") <- filter_summary
   attr(filtered, "confounder_summary") <- confounder_summary
 
-  if (!is.null(output_file)) {
-    output_file <- normalizePath(output_file, winslash = "/", mustWork = FALSE)
-    dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
-    attr(filtered, "output_file") <- output_file
-    saveRDS(filtered, output_file)
-  }
   filtered
 }
 
@@ -236,9 +248,9 @@ filter_TF_prescreen_results <- function(
 build_TF_mcmc_input_from_prescreen <- function(
   prescreen_filtered_results,
   screening_input,
-  direction_effect = 0.2,
-  beta_sd_floor = 0.5,
-  stage1_sd_multiplier = 1.5,
+  direction_effect = NULL,
+  beta_sd_floor = NULL,
+  stage1_sd_multiplier = NULL,
   alpha_prior_sd = 1,
   output_file = NULL
 ) {
@@ -251,6 +263,8 @@ build_TF_mcmc_input_from_prescreen <- function(
   if (!is.list(screening_input) || !length(screening_input)) {
     tf_prescreen_stop("`screening_input` must be a non-empty nested list.")
   }
+  tf_stage2_warn_legacy_prior_arguments(direction_effect, beta_sd_floor,
+                                       stage1_sd_multiplier)
   if (!is.numeric(alpha_prior_sd) || length(alpha_prior_sd) != 1L ||
       !is.finite(alpha_prior_sd) || alpha_prior_sd <= 0) {
     tf_prescreen_stop("`alpha_prior_sd` must be one finite positive number.")
@@ -310,31 +324,30 @@ build_TF_mcmc_input_from_prescreen <- function(
       )
     }
     stage1_summary <- stage1_table[stage1_index, , drop = FALSE]
-    stage2_prior <- tf_stage2_prior_from_stage1(
-      stage1_beta_mean = stage1_summary$beta_mean,
-      stage1_beta_sd = stage1_summary$beta_sd,
-      direction = entry$stan_data$direction,
-      direction_effect = direction_effect,
-      beta_sd_floor = beta_sd_floor,
-      stage1_sd_multiplier = stage1_sd_multiplier
-    )
-    entry$stan_data$beta_prior_mean <- stage2_prior$beta_prior_mean
-    entry$stan_data$beta_prior_sd <- stage2_prior$beta_prior_sd
-    entry$stan_data$beta_init <- stage2_prior$stage1_beta_mean
+    # Retain the original, predictor-aligned knowledge prior. Stage 1 posterior
+    # means initialize sampling only; neither posterior means nor SDs set priors.
+    stage2_prior <- tf_stage2_knowledge_prior(entry$stan_data)
+    entry$stan_data$beta_prior_mean <- NULL
+    entry$stan_data$beta_prior_sd <- NULL
+    entry$stan_data$beta_init <- as.numeric(stage1_summary$beta_mean)
     entry$stan_data$alpha_prior_sd <- as.numeric(alpha_prior_sd)
     entry$stage1_beta_summary <- data.frame(
       tf = entry$feature_names,
-      stage1_beta_mean = stage2_prior$stage1_beta_mean,
-      stage1_beta_sd = stage2_prior$stage1_beta_sd,
-      direction = stage2_prior$direction,
+      stage1_beta_mean = stage1_summary$beta_mean,
+      stage1_beta_sd = stage1_summary$beta_sd,
+      direction = entry$stan_data$direction,
       stringsAsFactors = FALSE
     )
     entry$stage2_prior <- data.frame(
       tf = entry$feature_names,
-      beta_prior_mean = stage2_prior$beta_prior_mean,
-      beta_prior_sd = stage2_prior$beta_prior_sd,
+      prior_family = "laplace",
+      confidence = stage2_prior$confidence,
+      direction = stage2_prior$direction,
+      beta_lambda_positive = stage2_prior$beta_lambda_positive,
+      beta_lambda_negative = stage2_prior$beta_lambda_negative,
       stringsAsFactors = FALSE
     )
+    entry$stage2_knowledge_prior <- stage2_prior
     entry$prescreen_original_predictor_count <- length(keep_index) +
       attr(prescreen_filtered_results, "filter_summary")$
         confounders_removed_by_interval[
@@ -351,6 +364,7 @@ build_TF_mcmc_input_from_prescreen <- function(
   }
   class(result) <- unique(c("TFMCMCInputFromPrescreen", class(screening_input)))
   attr(result, "pipeline_stage") <- "mcmc_input"
+  attr(result, "prior_family") <- "laplace"
   attr(result, "prescreen_prior_family") <- "laplace"
   attr(result, "prescreen_target_interval") <-
     attr(prescreen_filtered_results, "target_interval")
@@ -358,12 +372,13 @@ build_TF_mcmc_input_from_prescreen <- function(
     attr(prescreen_filtered_results, "confounder_interval")
   attr(result, "prescreen_filter_counts") <-
     attr(prescreen_filtered_results, "filter_counts")
+  attr(result, "prescreen_screening_audit") <-
+    attr(prescreen_filtered_results, "screening_audit")
   attr(result, "model_version") <- tf_shared_stage2_model_version()
   attr(result, "stan_file") <- "TF_stage2_directional_nb_model.stan"
   attr(result, "stage2_prior_config") <- list(
-    direction_effect = as.numeric(direction_effect),
-    beta_sd_floor = as.numeric(beta_sd_floor),
-    stage1_sd_multiplier = as.numeric(stage1_sd_multiplier),
+    prior_family = "laplace",
+    prior_source = "stage1_knowledge_prior",
     alpha_prior_sd = as.numeric(alpha_prior_sd)
   )
 

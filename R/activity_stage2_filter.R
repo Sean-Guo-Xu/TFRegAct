@@ -8,16 +8,44 @@ filter_TF_mcmc_gene_results <- function(
   screening_results,
   target_interval = 0.90,
   confounder_interval = 0.90,
-  output_file = NULL
+  output_file = NULL,
+  fallback_target_interval = NULL
+) {
+  filtered <- tf_screening_filter_with_fallback(
+    screening_results, target_interval, fallback_target_interval,
+    function(models, interval) tf_mcmc_gene_filter_once(models, interval, confounder_interval)
+  )
+  if (is.null(output_file)) {
+    input_file <- attr(screening_results, "output_file")
+    output_dir <- if (!is.null(input_file) && nzchar(input_file[[1]])) {
+      dirname(input_file[[1]])
+    } else {
+      file.path(getwd(), "adjustment_output")
+    }
+    target_tf <- attr(screening_results, "target_tf")
+    if (is.null(target_tf) || !nzchar(target_tf[[1]])) target_tf <- "target_TF"
+    output_file <- file.path(output_dir,
+      sprintf("%s_stage2_laplace_mcmc_gene_filtered.rds", target_tf[[1]]))
+  }
+  output_file <- normalizePath(output_file, winslash = "/", mustWork = FALSE)
+  dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
+  attr(filtered, "output_file") <- output_file
+  saveRDS(filtered, output_file)
+  filtered
+}
+
+tf_mcmc_gene_filter_once <- function(
+  screening_results, target_interval, confounder_interval
 ) {
   if (!is.list(screening_results) || !length(screening_results)) {
     stop("`screening_results` must be a non-empty Stage 1 result list.",
          call. = FALSE)
   }
   if (!identical(attr(screening_results, "inference"), "mcmc") ||
-      !identical(attr(screening_results, "prior_family"), "normal")) {
+      !identical(attr(screening_results, "prior_family"), "laplace") ||
+      !identical(attr(screening_results, "input_pipeline_stage"), "mcmc_input")) {
     stop(
-      "Stage 2 filtering requires MCMC results from the Normal-prior model.",
+      "Stage 2 filtering requires MCMC results from the knowledge Laplace-prior model.",
       call. = FALSE
     )
   }
@@ -88,7 +116,7 @@ filter_TF_mcmc_gene_results <- function(
     if (!is.list(model$stage2_parameter_draws) ||
         !identical(
           model$stage2_parameter_draws$interface_version,
-          "tf_em_stage2_parameter_draws_v1"
+          "tf_em_stage2_parameter_draws_v2"
         )) {
       stop(sprintf(
         "Stage 1 model `%s` does not contain the EM Stage 2 draw interface.",
@@ -219,6 +247,7 @@ filter_TF_mcmc_gene_results <- function(
   attr(filtered, "pipeline_stage") <- "mcmc"
   attr(filtered, "target_tf") <- attr(screening_results, "target_tf")
   attr(filtered, "model_version") <- attr(screening_results, "model_version")
+  attr(filtered, "prior_family") <- "laplace"
   attr(filtered, "target_interval") <- target_interval
   attr(filtered, "confounder_interval") <- confounder_interval
   attr(filtered, "confounders_filtered") <- FALSE
@@ -246,42 +275,23 @@ filter_TF_mcmc_gene_results <- function(
   attr(filtered, "filter_counts") <- filter_counts
   attr(filtered, "filter_summary") <- filter_summary
 
-  if (is.null(output_file)) {
-    input_file <- attr(screening_results, "output_file")
-    output_dir <- if (!is.null(input_file) && nzchar(input_file[[1]])) {
-      dirname(input_file[[1]])
-    } else {
-      file.path(getwd(), "adjustment_output")
-    }
-    target_tf <- attr(screening_results, "target_tf")
-    if (is.null(target_tf) || !nzchar(target_tf[[1]])) target_tf <- "target_TF"
-    output_file <- file.path(
-      output_dir,
-      sprintf(
-        "%s_stage1_screening_stage2_ready_filtered_results.rds",
-        target_tf[[1]]
-      )
-    )
-  }
-  output_file <- normalizePath(output_file, winslash = "/", mustWork = FALSE)
-  dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
-  attr(filtered, "output_file") <- output_file
-  saveRDS(filtered, output_file)
   filtered
 }
 
 # Backward-compatible name. Its behavior now follows the three-stage design:
-# it accepts only Normal-prior MCMC results and never filters confounders.
+# it accepts only knowledge Laplace-prior MCMC results and never filters confounders.
 filter_TF_stage1_screening_results <- function(
   screening_results,
   target_interval = 0.90,
   confounder_interval = 0.90,
-  output_file = NULL
+  output_file = NULL,
+  fallback_target_interval = NULL
 ) {
   filter_TF_mcmc_gene_results(
     screening_results = screening_results,
     target_interval = target_interval,
     confounder_interval = confounder_interval,
-    output_file = output_file
+    output_file = output_file,
+    fallback_target_interval = fallback_target_interval
   )
 }
