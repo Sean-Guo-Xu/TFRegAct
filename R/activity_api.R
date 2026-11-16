@@ -50,6 +50,8 @@
 #' @param cores Number of gene-model workers. Each worker processes one gene at
 #'   a time. Each MCMC stage can launch up to `cores * mcmc_parallel_chains`
 #'   chains. Stage 3 can fit up to `cores` selected posterior draws at a time.
+#' @param confounder_confidence_threshold Minimum prior-edge confidence for the
+#'   adjustment network. Default 1.
 #' @param prescreen_inference Stage 1 inference. `"variational"` (default)
 #'   uses mean-field ADVI. `"mcmc"` uses the same chain count and concurrency
 #'   as Stage 2, with separate per-chain iteration budgets.
@@ -63,16 +65,17 @@
 #'   in one Stage 3 fit. A positive count selects that many joint Stage 2 draws
 #'   without replacement for separate conditional fits.
 #' @param em_iter_warmup Discarded joint beta/activity sweeps per Stage 3 fit.
-#'   Default 500.
+#'   Default 1000.
 #' @param em_iter_sampling Retained joint beta/activity sweeps per Stage 3 fit.
-#'   Default 500.
+#'   Default 1000.
 #' @param em_algorithm Stage 3 algorithm. `gibbs_ars` samples the joint
 #'   coefficient/activity posterior. `quadrature_em` uses conditional-MAP EM.
 #' @param prescreen_fallback_target_interval One-time Stage 1 target interval
 #'   used only if no target survives the requested interval. Defaults to 0.80
 #'   when the initial interval is above 0.80; otherwise disabled. NULL disables fallback.
-#' @param mcmc_fallback_target_interval Optional equivalent fallback for Stage 2.
-#'   Disabled by default. Confounder thresholds are never relaxed.
+#' @param mcmc_fallback_target_interval Target interval to try once if Stage 2
+#'   retains no targets. Defaults to 0.80 when the primary interval exceeds 0.80.
+#'   Set `NULL` to disable the fallback. The confounder rule is unchanged.
 TF_activity_computation <- function(
   target_tf = NULL,
   input = NULL,
@@ -95,7 +98,7 @@ TF_activity_computation <- function(
   network_edge_file = .tfregact_default_network_file(),
   target_confidence_threshold = 4,
   target_confidence_override = NULL,
-  confounder_confidence_threshold = 4,
+  confounder_confidence_threshold = 1,
   adjustment_search_starts = 1L,
   max_adjustment_sets = NULL,
   dagitty_beta = 2,
@@ -128,11 +131,11 @@ TF_activity_computation <- function(
   force_refit = FALSE,
   force_recompile = FALSE,
   mcmc_parallel_chains = mcmc_chains,
-  em_iter_warmup = 500L,
-  em_iter_sampling = 500L,
+  em_iter_warmup = 1000L,
+  em_iter_sampling = 1000L,
   em_algorithm = c("gibbs_ars", "quadrature_em"),
   prescreen_fallback_target_interval = if (prescreen_target_interval > 0.80) 0.80 else NULL,
-  mcmc_fallback_target_interval = NULL,
+  mcmc_fallback_target_interval = if (mcmc_target_interval > 0.80) 0.80 else NULL,
   prescreen_inference = c("variational", "mcmc"),
   prescreen_mcmc_iter_warmup = 200L,
   prescreen_mcmc_iter_sampling = 200L

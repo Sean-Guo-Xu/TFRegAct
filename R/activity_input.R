@@ -206,7 +206,7 @@ query_TF_target_adjustment_sets <- function(
   edge_file = "tf_union_output/TF_Full_Map.RData",
   outdir = "adjustment_output",
   beta = 2,
-  confounder_confidence_threshold = 4,
+  confounder_confidence_threshold = 1,
   search_starts = 1L,
   search_seed = 123L,
   cores = 4L,

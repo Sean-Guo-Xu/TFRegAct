@@ -183,9 +183,10 @@ and asymmetric-Laplace EM optimization including beta = 0.
 For activity inference, omit `target_gene`. The function identifies direct
 targets, finds target-specific adjustment sets, performs screening and MCMC
 refinement, then returns a Seurat object containing `<TF>_activity_A`.
-By default, direct target edges and prior-network edges must have confidence
-at least 4. Both workflows use an exact minimum-vertex-cut solver on the
-moralized ancestor subgraph of the back-door graph. The selected set has the
+By default, the minimum confidence is 4 for direct target edges and 1 for edges
+in the activity adjustment network. Both workflows use an exact
+minimum-vertex-cut solver on the moralized ancestor subgraph of the back-door
+graph. The selected set has the
 fewest nodes under the current DAG and the package's Pearl back-door constraint
 (no adjustment for descendants of the target TF). This does not establish that
 the supplied DAG is biologically correct. One representative minimum set is
@@ -241,7 +242,7 @@ actual activity is zero in that state. Each sweep also proposes a reciprocal
 scale move that increases coefficients while decreasing centered activity,
 or the reverse. Its Metropolis-Hastings test includes the full posterior and
 transformation Jacobian. The warmup and retained sweep counts are controlled
-by `em_iter_warmup` and `em_iter_sampling`, both defaulting to 500 per fit. These are
+by `em_iter_warmup` and `em_iter_sampling`, both defaulting to 1000 per fit. These are
 posterior sampling sweeps rather than optimizer iterations. Completion alone
 does not establish convergence; sampler diagnostics include effective sample
 sizes and the scale-move acceptance rate.
@@ -275,9 +276,11 @@ table. The fallback is disabled by default when the initial interval is 80%
 or lower, and can be disabled explicitly with
 `prescreen_fallback_target_interval = NULL`.
 
-Stage 2 has the same optional rule via `mcmc_fallback_target_interval = 0.80`,
-which is disabled by default. Filtered RDS objects, gene summary CSV files and
-the pipeline's `screening_audit` record requested and effective intervals,
+Stage 2 also retries the target screen once at 80% by default, using the
+same MCMC draws. If the retry retains any target genes, Stage 3 uses them.
+If it retains none, the pipeline stops before Stage 3. Set
+`mcmc_fallback_target_interval = NULL` to disable this retry. Filtered RDS
+objects, gene summary CSV files and the pipeline's `screening_audit` record requested and effective intervals,
 whether fallback was attempted, and the initial/final target counts. New fit
 summaries retain full target marginals even when only one nuisance draw is
 kept. A legacy VI cache without those marginals requires `force_refit = TRUE`
@@ -422,7 +425,7 @@ when diagnostics indicate a problem.
 | `network_edge_file` | package cache | FullMap regulatory-network file; normally left unchanged. |
 | `target_confidence_threshold` | `4` | Minimum confidence for direct target-TF-to-gene edges entering activity inference. |
 | `target_confidence_override` | `NULL` | Optional named values or data frame replacing selected target-edge confidence values. |
-| `confounder_confidence_threshold` | `4` | Minimum network confidence for candidate confounder edges. |
+| `confounder_confidence_threshold` | `1` | Minimum network confidence for candidate confounder edges. |
 | `adjustment_search_starts` | `1` | Compatibility argument; ignored. Exact minimum-cut search runs once per target gene. Activity `cores` still parallelizes different target genes. |
 | `max_adjustment_sets` | `NULL` | Deprecated compatibility argument; ignored by minimum-cut search. |
 | `dagitty_beta` | `2` | Relative weight given to confidence on paths towards each target gene. |
@@ -451,7 +454,7 @@ when diagnostics indicate a problem.
 | `stage1_sd_multiplier` | `NULL` | Deprecated compatibility argument; non-`NULL` values are ignored with a warning. |
 | `stage2_alpha_prior_sd` | `1` | Stage 2 intercept-prior SD. |
 | `mcmc_target_interval` | `0.90` | Stage 2 interval used to retain target-gene models. |
-| `mcmc_fallback_target_interval` | `NULL` | Optional one-time fallback if Stage 2 is empty; set `0.80` to enable an 80% target interval. |
+| `mcmc_fallback_target_interval` | `0.80` | One-time target-only fallback if Stage 2 is empty; disabled when the initial interval is 80% or lower. Set `NULL` to disable. |
 | `mcmc_confounder_interval` | `0.90` | Interval level recorded for confounder summaries. Stage 2 does not remove confounders. |
 | `mcmc_chains` | `3` | Chains per gene in Stage 2 and in Stage 1 when using MCMC. |
 | `mcmc_parallel_chains` | `mcmc_chains` | Concurrent chains per gene worker; three by default. |
@@ -460,8 +463,8 @@ when diagnostics indicate a problem.
 | `mcmc_adapt_delta` | `0.95` | Stage 2 HMC target acceptance probability. |
 | `mcmc_max_treedepth` | `12` | Stage 2 maximum HMC tree depth. |
 | `em_algorithm` | `"gibbs_ars"` | Joint coefficient/activity posterior sampling; `"quadrature_em"` selects legacy conditional-MAP EM. |
-| `em_iter_warmup` | `500` | Discarded Stage 3 sweeps per nuisance component under `gibbs_ars`. |
-| `em_iter_sampling` | `500` | Retained Stage 3 sweeps per nuisance component under `gibbs_ars`. |
+| `em_iter_warmup` | `1000` | Discarded Stage 3 sweeps per nuisance component under `gibbs_ars`. |
+| `em_iter_sampling` | `1000` | Retained Stage 3 sweeps per nuisance component under `gibbs_ars`. |
 | `nuisance_draw_count` | `0` | Use Stage 2 nuisance posterior means in one fit. A positive count selects joint Stage 2 draws without replacement, with one fit per draw. |
 | `active_prior_zero` | `0.2` | Prior active probability for a cell whose normalized target-TF expression is zero. The corresponding prior zero-activity probability is `0.8`. |
 | `em_control` | `list()` | Optional named list of advanced Stage 3 numerical controls described below. |

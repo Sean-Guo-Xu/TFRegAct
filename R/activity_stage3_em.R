@@ -1267,7 +1267,7 @@ tf_em_summarize_draw_results <- function(draw_results, common, settings) {
 #' The default Gibbs sampler uses ARS for the log-concave coefficient and
 #' positive-activity conditionals, an auxiliary slab variable for the zero
 #' spike, and a joint coefficient/activity scale Metropolis move. Warmup and
-#' retained iterations each default to 500. Stage 2 target-beta posterior means
+#' retained iterations each default to 1000. Stage 2 target-beta posterior means
 #' initialize the sampler and the network asymmetric-Laplace prior is retained.
 #' One chain is run per nuisance component, so convergence is reported as
 #' unknown, with within-chain ESS and proposal acceptance diagnostics.
@@ -1303,8 +1303,8 @@ run_TF_EM_latent_activity <- function(
   retry_errors = TRUE,
   save_traces = FALSE,
   algorithm = "gibbs_ars",
-  iter_warmup = 500L,
-  iter_sampling = 500L,
+  iter_warmup = 1000L,
+  iter_sampling = 1000L,
   scale_move_sd = 0.1
 ) {
   stage2_input <- tf_em_validate_input(stage2_input)
