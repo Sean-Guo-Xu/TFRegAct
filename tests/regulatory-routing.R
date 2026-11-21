@@ -41,7 +41,8 @@ stopifnot(identical(design, shuffled), design$S == 4L,
   identical(d$direction, as.integer(stage1_data$direction)), d$gamma == 1.8,
   d$eta == 0.7, d$r_dir == 4,
   isTRUE(all.equal(d$beta_init, unname(colMeans(draws)))),
-  is.null(d$beta_prior_mean), is.null(d$beta_prior_sd))
+  identical(d$beta_prior_mean, attr(d, "stage2_prior")$beta_prior_mean),
+  identical(d$beta_prior_sd, attr(d, "stage2_prior")$beta_prior_sd))
 expect_error(ns$tf_hierarchical_sample_design(d, obj[[]], NULL), 'requires')
 bad <- obj[[]]; bad$donor[21] <- 's1'
 expect_error(ns$tf_hierarchical_sample_design(d, bad, 'donor'), 'multiple conditions')
@@ -84,4 +85,4 @@ for (type in c('single_cell','bulk')) for (condition in c(FALSE,TRUE)) {
   }
 }
 expect_error(pipeline(input = input, data_type = 'bulk'), 'disagrees')
-cat('PASS: all routes, sample alignment, replicate guards, and original Stage 1 knowledge priors.\n')
+cat('PASS: all routes, sample alignment, replicate guards, and network Normal Stage 2 priors.\n')

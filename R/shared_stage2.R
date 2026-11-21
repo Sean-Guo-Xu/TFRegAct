@@ -3,7 +3,7 @@ tf_shared_stage2_stop <- function(...) {
 }
 
 tf_shared_stage2_model_version <- function() {
-  "stage1_stage2_shared_knowledge_laplace_v7"
+  "stage1_laplace_stage2_knowledge_normal_v8"
 }
 
 tf_stage2_warn_legacy_prior_arguments <- function(
@@ -14,14 +14,14 @@ tf_stage2_warn_legacy_prior_arguments <- function(
     stage1_sd_multiplier = !is.null(stage1_sd_multiplier))
   if (any(supplied)) {
     warning(paste0("`", paste(names(supplied)[supplied], collapse = "`, `"),
-      "` are deprecated and ignored; Stage 2 reuses the Stage 1 knowledge prior."),
+      "` are deprecated and ignored; Stage 2 uses its confidence-weighted network Normal prior."),
       call. = FALSE)
   }
   invisible(NULL)
 }
 
-# Describe the original network-informed prior; posterior moments are not inputs.
-tf_stage2_knowledge_prior <- function(stan_data) {
+# Stage 1 retains its original directional Laplace screening prior.
+tf_stage1_knowledge_prior <- function(stan_data) {
   fields <- c("P", "confidence", "direction", "gamma", "eta", "r_dir")
   missing <- setdiff(fields, names(stan_data))
   if (length(missing)) {
@@ -60,12 +60,44 @@ tf_stage2_knowledge_prior <- function(stan_data) {
   )
 }
 
+# The Stage 2 prior is determined by network evidence, never fitted moments.
+# Its second Normal parameter is a standard deviation; the baseline 0.5 and
+# confidence increment 1.5 below describe VARIANCE, not standard deviation.
+tf_stage2_knowledge_prior <- function(stan_data) {
+  fields <- c("P", "confidence", "direction")
+  missing <- setdiff(fields, names(stan_data))
+  if (length(missing)) {
+    tf_shared_stage2_stop("Stage 2 network-prior metadata are missing: %s.",
+      paste(missing, collapse = ", "))
+  }
+  P <- stan_data$P
+  confidence <- as.numeric(stan_data$confidence)
+  direction <- as.numeric(stan_data$direction)
+  if (length(P) != 1L || !is.finite(P) || P < 1L || P != as.integer(P) ||
+      length(confidence) != P || any(!is.finite(confidence)) ||
+      any(confidence < 0) || length(direction) != P ||
+      any(!is.finite(direction)) || any(!direction %in% c(-1L, 0L, 1L))) {
+    tf_shared_stage2_stop("Invalid confidence or direction in the Stage 2 network prior.")
+  }
+  confidence <- pmin(pmax(confidence, 1), 10)
+  weight <- (confidence - 1) / 9
+  prior_mean <- as.integer(direction) * (0.2 + 0.4 * weight)
+  prior_variance <- 0.5 + 1.5 * weight
+  list(
+    prior_family = "normal", confidence = confidence,
+    direction = as.integer(direction), confidence_weight = weight,
+    beta_prior_mean = prior_mean, beta_prior_variance = prior_variance,
+    beta_prior_sd = sqrt(prior_variance)
+  )
+}
+
 tf_shared_stage2_data_fields <- function() {
   c(
     "N", "P", "Y", "X", "Q", "W", "W_prior_scale",
     "has_condition", "condition_w_index", "condition",
     "K_batch", "batch", "batch_level_design", "log_offset",
     "confidence", "direction", "gamma", "eta", "r_dir", "alpha_prior_sd",
+    "beta_prior_mean", "beta_prior_sd",
     "target_tf_index", "use_target_interaction",
     "target_condition_centered", "target_interaction_sd"
   )
@@ -94,7 +126,21 @@ tf_validate_shared_stage2_data <- function(stan_data) {
       !is.finite(stan_data$alpha_prior_sd) || stan_data$alpha_prior_sd <= 0) {
     tf_shared_stage2_stop("Shared Stage 2 data have inconsistent dimensions or priors.")
   }
-  tf_stage2_knowledge_prior(stan_data)
+  prior <- tf_stage2_knowledge_prior(stan_data)
+  if (length(stan_data$beta_prior_mean) != P || length(stan_data$beta_prior_sd) != P ||
+      any(!is.finite(stan_data$beta_prior_mean)) ||
+      any(!is.finite(stan_data$beta_prior_sd)) || any(stan_data$beta_prior_sd <= 0) ||
+      !isTRUE(all.equal(as.numeric(stan_data$beta_prior_mean), prior$beta_prior_mean,
+                       tolerance = 1e-12)) ||
+      !isTRUE(all.equal(as.numeric(stan_data$beta_prior_sd), prior$beta_prior_sd,
+                       tolerance = 1e-12))) {
+    tf_shared_stage2_stop("Stage 2 Normal prior parameters differ from the network confidence/direction mapping.")
+  }
+  if (!is.null(stan_data$beta_prior_variance) &&
+      !isTRUE(all.equal(as.numeric(stan_data$beta_prior_variance), prior$beta_prior_variance,
+                       tolerance = 1e-12))) {
+    tf_shared_stage2_stop("Stage 2 Normal prior variance differs from the network confidence mapping.")
+  }
   has_condition <- as.integer(stan_data$has_condition)
   use_interaction <- as.integer(stan_data$use_target_interaction)
   if (!has_condition %in% 0:1 || !use_interaction %in% 0:1 ||

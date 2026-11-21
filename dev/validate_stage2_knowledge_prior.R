@@ -1,6 +1,6 @@
 # Small executable-model check; run from the package root after installation.
 # This checks prior routing and execution, not biological accuracy.
-.libPaths(c("D:/Probscorer/.validation/stage2-knowledge-prior/library", "D:/R", .libPaths()))
+.libPaths(c("D:/Probscorer/.validation/normal-knowledge-prior/library", "D:/R", .libPaths()))
 library(TFRegAct)
 ns <- asNamespace("TFRegAct")
 set.seed(20261108)
@@ -44,8 +44,17 @@ fits <- list(stage1 = stage1, plain = plain, interaction = interaction,
 report <- lapply(names(fits), function(name) {
   result <- fits[[name]]
   stopifnot(all(result$fit$return_codes() == 0L))
-  prior <- ns$tf_stage2_knowledge_prior(result$stan_data)
-  stopifnot(identical(prior, ns$tf_stage2_knowledge_prior(stage1$stan_data)))
+  prior <- if (name == "stage1") ns$tf_stage1_knowledge_prior(result$stan_data) else {
+    ns$tf_stage2_knowledge_prior(result$stan_data)
+  }
+  if (name == "stage1") {
+    stopifnot(prior$prior_family == "laplace")
+  } else {
+    stopifnot(prior$prior_family == "normal",
+      identical(prior, ns$tf_stage2_knowledge_prior(stage1$stan_data)),
+      identical(result$stan_data$beta_prior_mean, prior$beta_prior_mean),
+      identical(result$stan_data$beta_prior_sd, sqrt(prior$beta_prior_variance)))
+  }
   summary <- result$fit$summary(c("beta", "beta_target_delta"))
   diagnostic <- result$fit$diagnostic_summary()
   data.frame(model = name, draws = nrow(result$fit$draws("beta", format = "matrix")),
@@ -55,9 +64,9 @@ report <- lapply(names(fits), function(name) {
 })
 report <- do.call(rbind, report)
 print(report)
-outdir <- "D:/Probscorer/.validation/stage2-knowledge-prior"
+outdir <- "D:/Probscorer/.validation/normal-knowledge-prior"
 dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
 write.csv(report, file.path(outdir, "stan-smoke-summary.csv"), row.names = FALSE)
 saveRDS(list(report = report, prior = ns$tf_stage2_knowledge_prior(stage1$stan_data)),
   file.path(outdir, "stan-smoke-summary.rds"))
-cat("PASS: Stage 1 and all regulatory Stage 2 routes execute with identical knowledge priors.\n")
+cat("PASS: Stage 1 executes with unchanged Laplace; all regulatory Stage 2 routes use aligned network Normal priors.\n")

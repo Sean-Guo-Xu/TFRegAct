@@ -47,7 +47,8 @@ model <- function(overall = fixed + 1.45, control = NULL, disease = NULL) {
     confounders = rbind(parameter("C_KEEP", fixed + 3, "confounder"),
                        parameter("C_DROP", fixed + 1.45, "confounder")),
     target_screening_draws = payload,
-    stage2_parameter_draws = list(interface_version = "tf_em_stage2_parameter_draws_v2",
+    stage2_parameter_draws = list(interface_version = "tf_em_stage2_parameter_draws_v3",
+      prior_family = "normal", beta_prior_family = "normal",
       draw_count = n, source_draw_index = seq_len(n), target_tf_index = 1L,
       beta = cbind(T = overall, C_KEEP = fixed + 3, C_DROP = fixed + 1.45),
       beta_target_control = if (has_condition) control else overall,
@@ -58,7 +59,7 @@ model <- function(overall = fixed + 1.45, control = NULL, disease = NULL) {
 failed <- list(status = "error", target_tf_name = "T", error = "Synthetic posterior retrieval failure")
 results <- function(stage, models) {
   attr(models, "inference") <- if (stage == "prescreen") "variational" else "mcmc"
-  attr(models, "prior_family") <- "laplace"
+  attr(models, "prior_family") <- if (stage == "prescreen") "laplace" else "normal"
   attr(models, "target_tf") <- "T"
   attr(models, "model_version") <- "constructed_test"
   if (stage == "mcmc") attr(models, "input_pipeline_stage") <- "mcmc_input"

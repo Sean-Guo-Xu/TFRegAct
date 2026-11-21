@@ -56,22 +56,27 @@ tf_em_validate_input <- function(stage2_input) {
     stage2_input <- readRDS(stage2_input)
   }
   if (!is.list(stage2_input) ||
-      !identical(stage2_input$interface_version, "tf_em_stage2_input_v4")) {
-    tf_em_stop("`stage2_input` must use interface `tf_em_stage2_input_v4`.")
+      !identical(stage2_input$interface_version, "tf_em_stage2_input_v6")) {
+    tf_em_stop("`stage2_input` must use interface `tf_em_stage2_input_v6`; rebuild older prior inputs.")
   }
   required <- c(
     "N", "G", "S", "Y", "eta0_draws", "phi_draws", "has_condition", "condition",
     "target_tf_expression", "target_tf_center", "target_tf_scale",
     "beta_target_mean_init", "beta_target_delta_init", "beta_prior_family",
-    "beta_lambda_positive", "beta_lambda_negative", "target_interaction_sd",
+    "beta_prior_source", "beta_prior_mean", "beta_prior_variance", "beta_prior_sd",
+    "beta_delta_prior_mean", "beta_delta_prior_variance", "beta_delta_prior_sd",
+    "beta_delta_prior_covariance",
     "cell_names", "target_genes"
   )
   missing <- setdiff(required, names(stage2_input))
   if (length(missing)) {
     tf_em_stop("EM Stage2 input is missing: %s.", paste(missing, collapse = ", "))
   }
-  if (!identical(stage2_input$beta_prior_family, "laplace")) {
-    tf_em_stop("EM requires the Stage2 knowledge-based asymmetric Laplace beta prior.")
+  if (!identical(stage2_input$beta_prior_family, "normal")) {
+    tf_em_stop("Stage 3 requires a Normal approximation to the Stage 2 coefficient posterior.")
+  }
+  if (!identical(stage2_input$beta_prior_source, "stage2_posterior_normal_approximation")) {
+    tf_em_stop("Stage 3 coefficient priors must come from the Stage 2 posterior, not the network prior.")
   }
   N <- as.integer(stage2_input$N)
   G <- as.integer(stage2_input$G)
@@ -106,8 +111,9 @@ tf_em_validate_input <- function(stage2_input) {
     tf_em_stop("Y, eta0_draws, and phi_draws contain invalid values.")
   }
   gene_vectors <- c(
-    "beta_target_mean_init", "beta_target_delta_init", "beta_lambda_positive",
-    "beta_lambda_negative", "target_interaction_sd"
+    "beta_target_mean_init", "beta_target_delta_init", "beta_prior_mean",
+    "beta_prior_variance", "beta_prior_sd", "beta_delta_prior_mean",
+    "beta_delta_prior_variance", "beta_delta_prior_sd", "beta_delta_prior_covariance"
   )
   for (field in gene_vectors) {
     value <- stage2_input[[field]]
@@ -115,10 +121,38 @@ tf_em_validate_input <- function(stage2_input) {
       tf_em_stop("`%s` must contain one finite value per target gene.", field)
     }
   }
-  if (any(stage2_input$beta_lambda_positive <= 0) ||
-      any(stage2_input$beta_lambda_negative <= 0) ||
-      any(stage2_input$target_interaction_sd <= 0)) {
-    tf_em_stop("Beta prior rates and interaction scales must be positive.")
+  if (any(stage2_input$beta_prior_variance <= 0) ||
+      any(stage2_input$beta_prior_sd <= 0)) {
+    tf_em_stop("Beta posterior variances and standard deviations must be positive.")
+  }
+  if (any(abs(stage2_input$beta_prior_sd ^ 2 - stage2_input$beta_prior_variance) >
+          1e-10 * stage2_input$beta_prior_variance)) {
+    tf_em_stop("Beta prior standard deviations must be the square roots of the prior variances.")
+  }
+  if (has_condition) {
+    if (any(stage2_input$beta_delta_prior_variance <= 0) ||
+        any(stage2_input$beta_delta_prior_sd <= 0) ||
+        any(abs(stage2_input$beta_delta_prior_sd ^ 2 - stage2_input$beta_delta_prior_variance) >
+            1e-10 * stage2_input$beta_delta_prior_variance)) {
+      tf_em_stop("Condition-enabled Stage 3 requires positive, consistent delta posterior variances and SDs.")
+    }
+    correlation <- stage2_input$beta_delta_prior_covariance /
+      (stage2_input$beta_prior_sd * stage2_input$beta_delta_prior_sd)
+    if (any(!is.finite(correlation)) || any(abs(correlation) >= 1)) {
+      tf_em_stop("Stage 2 beta/delta posterior covariance matrices must be positive definite; no jitter is added.")
+    }
+  } else if (any(stage2_input$beta_delta_prior_mean != 0) ||
+             any(stage2_input$beta_delta_prior_variance != 0) ||
+             any(stage2_input$beta_delta_prior_sd != 0) ||
+             any(stage2_input$beta_delta_prior_covariance != 0) ||
+             any(stage2_input$beta_target_delta_init != 0)) {
+    tf_em_stop("Condition-free Stage 3 must keep delta and its posterior prior moments at zero.")
+  }
+  for (g in seq_len(G)) {
+    precision <- tf_em_gene_prior_information(stage2_input, g)
+    if (any(!is.finite(precision))) {
+      tf_em_stop("Non-finite posterior prior precision for target gene %d; no variance floor is added.", g)
+    }
   }
   if (length(stage2_input$cell_names) != N ||
       length(stage2_input$target_genes) != G ||
@@ -127,6 +161,23 @@ tf_em_validate_input <- function(stage2_input) {
     tf_em_stop("Cell and target-gene names must be complete and unique.")
   }
   stage2_input
+}
+
+# Invert the supplied Stage 2 posterior covariance without adding a floor or
+# inflation. A condition-free delta is fixed at zero rather than regularized.
+tf_em_gene_prior_information <- function(common, gene_index) {
+  beta_variance <- common$beta_prior_variance[[gene_index]]
+  if (!isTRUE(common$has_condition)) {
+    return(matrix(c(1 / beta_variance, 0, 0, 0), 2L, 2L))
+  }
+  delta_variance <- common$beta_delta_prior_variance[[gene_index]]
+  beta_sd <- common$beta_prior_sd[[gene_index]]
+  delta_sd <- common$beta_delta_prior_sd[[gene_index]]
+  correlation <- common$beta_delta_prior_covariance[[gene_index]] / (beta_sd * delta_sd)
+  remaining <- 1 - correlation ^ 2
+  cross_precision <- -correlation / (beta_sd * delta_sd * remaining)
+  matrix(c(1 / (beta_variance * remaining), cross_precision,
+           cross_precision, 1 / (delta_variance * remaining)), 2L, 2L)
 }
 
 tf_em_cell_log_kernel <- function(
@@ -432,22 +483,13 @@ tf_em_gene_expected_log_posterior <- function(
   log_likelihood <- sweep(eta, 1L, y_gene, FUN = "*") -
     sweep(log_denominator, 1L, y_gene + phi_gene, FUN = "*")
   expected_log_likelihood <- sum(estep$weights * log_likelihood)
-  lambda_positive <- common$beta_lambda_positive[[gene_index]]
-  lambda_negative <- common$beta_lambda_negative[[gene_index]]
-  log_prior <- if (parameters[[1]] >= 0) {
-    -lambda_positive * parameters[[1]]
-  } else {
-    lambda_negative * parameters[[1]]
-  }
-  log_prior <- log_prior - 0.5 * (
-    parameters[[2]] / common$target_interaction_sd[[gene_index]]
-  ) ^ 2
-  # At zero the prior has two one-sided derivatives. The constrained optimizer
-  # supplies its branch explicitly; there is no smooth derivative at the kink.
-  positive_branch <- if (is.null(beta_branch)) parameters[[1]] >= 0 else {
-    match.arg(beta_branch, c("positive", "negative")) == "positive"
-  }
-  prior_gradient <- if (positive_branch) -lambda_positive else lambda_negative
+  prior_difference <- c(parameters[[1]] - common$beta_prior_mean[[gene_index]],
+    if (common$has_condition) parameters[[2]] - common$beta_delta_prior_mean[[gene_index]] else 0)
+  prior_information <- tf_em_gene_prior_information(common, gene_index)
+  prior_gradient <- -as.numeric(prior_information %*% prior_difference)
+  log_prior <- 0.5 * sum(prior_difference * prior_gradient)
+  # The posterior-derived Normal prior is smooth through zero. `beta_branch` remains
+  # an unused internal compatibility argument for historical objective callers.
 
   probability_mu <- stats::plogis(eta - log(phi_gene))
   score_eta <- sweep(
@@ -460,9 +502,8 @@ tf_em_gene_expected_log_posterior <- function(
   common_gradient <- estep$weights * score_eta * activity_std
   condition_shift <- common$condition_shift
   gradient <- c(
-    sum(common_gradient) + prior_gradient,
-    sum(sweep(common_gradient, 1L, condition_shift, FUN = "*")) -
-      parameters[[2]] / common$target_interaction_sd[[gene_index]] ^ 2
+    sum(common_gradient) + prior_gradient[[1]],
+    sum(sweep(common_gradient, 1L, condition_shift, FUN = "*")) + prior_gradient[[2]]
   )
   result <- list(
     value = expected_log_likelihood + log_prior,
@@ -476,11 +517,10 @@ tf_em_gene_expected_log_posterior <- function(
       sum(curvature),
       sum(sweep(curvature, 1L, condition_shift, FUN = "*")),
       sum(sweep(curvature, 1L, condition_shift, FUN = "*")),
-      sum(sweep(curvature, 1L, condition_shift ^ 2, FUN = "*")) +
-        1 / common$target_interaction_sd[[gene_index]] ^ 2
-    ), 2L, 2L)
+      sum(sweep(curvature, 1L, condition_shift ^ 2, FUN = "*"))
+    ), 2L, 2L) + prior_information
     result$information <- information
-    result$at_prior_kink <- parameters[[1]] == 0
+    result$at_prior_kink <- FALSE
   }
   result
 }
@@ -495,75 +535,51 @@ tf_em_mstep <- function(common, eta0, phi, estep, beta_mean, beta_delta, setting
   branch_convergence <- matrix(NA_integer_, G, 2L,
     dimnames = list(common$target_genes, c("positive", "negative")))
   for (g in seq_len(G)) {
-    branch_fits <- lapply(c("positive", "negative"), function(branch) {
-      positive <- branch == "positive"
-      start_beta <- if (positive) max(beta_mean[[g]], 0) else min(beta_mean[[g]], 0)
-      start <- if (common$has_condition) c(start_beta, beta_delta[[g]]) else start_beta
-      unpack <- function(parameters) {
-        if (common$has_condition) parameters else c(parameters[[1]], 0)
-      }
-      objective_function <- function(parameters) {
-        -tf_em_gene_expected_log_posterior(
-          unpack(parameters), g, common, eta0[, g], phi[[g]], estep,
-          beta_branch = branch
-        )$value
-      }
-      gradient_function <- function(parameters) {
-        gradient <- tf_em_gene_expected_log_posterior(
-          unpack(parameters), g, common, eta0[, g], phi[[g]], estep,
-          beta_branch = branch
-        )$gradient
-        -gradient[seq_along(parameters)]
-      }
-      stats::optim(
-        par = start,
-        fn = objective_function,
-        gr = gradient_function,
-        method = "L-BFGS-B",
-        lower = c(if (positive) 0 else -Inf, if (common$has_condition) -Inf),
-        upper = c(if (positive) Inf else 0, if (common$has_condition) Inf),
-        control = list(
-          maxit = settings$mstep_maxit,
-          factr = max(1, settings$mstep_reltol / .Machine$double.eps),
-          pgtol = settings$mstep_reltol
-        )
-      )
-    })
-    branch_convergence[g, ] <- vapply(branch_fits, `[[`, integer(1), "convergence")
-    # The expected NB log likelihood is concave in (beta, delta), and each
-    # Laplace half-axis is smooth. Comparing both constrained solutions includes
-    # the kink and avoids pretending that the full prior is differentiable.
-    fit <- branch_fits[[which.min(vapply(branch_fits, `[[`, numeric(1), "value"))]]
+    start <- if (common$has_condition) c(beta_mean[[g]], beta_delta[[g]]) else beta_mean[[g]]
+    unpack <- function(parameters) {
+      if (common$has_condition) parameters else c(parameters[[1]], 0)
+    }
+    objective_function <- function(parameters) {
+      -tf_em_gene_expected_log_posterior(
+        unpack(parameters), g, common, eta0[, g], phi[[g]], estep
+      )$value
+    }
+    gradient_function <- function(parameters) {
+      gradient <- tf_em_gene_expected_log_posterior(
+        unpack(parameters), g, common, eta0[, g], phi[[g]], estep
+      )$gradient
+      -gradient[seq_along(parameters)]
+    }
+    # The expected NB log likelihood is concave, and the Normal priors add
+    # strictly negative curvature. Optimize the smooth unconstrained objective.
+    fit <- stats::optim(
+      par = start, fn = objective_function, gr = gradient_function,
+      method = "BFGS", control = list(maxit = settings$mstep_maxit,
+                                       reltol = settings$mstep_reltol)
+    )
     fitted_parameters <- if (common$has_condition) fit$par else c(fit$par[[1]], 0)
     if (any(!is.finite(fit$par)) || !is.finite(fit$value)) {
       tf_em_stop("Non-finite M-step result for gene `%s`.", common$target_genes[[g]])
     }
     updated_mean[[g]] <- fitted_parameters[[1]]
     updated_delta[[g]] <- fitted_parameters[[2]]
-    at_prior_kink[[g]] <- fitted_parameters[[1]] == 0
     convergence[[g]] <- fit$convergence
     objective[[g]] <- -fit$value
     information <- tf_em_gene_expected_log_posterior(
       fitted_parameters, g, common, eta0[, g], phi[[g]], estep,
       return_information = TRUE
     )$information
-    if (at_prior_kink[[g]]) {
-      # A Gaussian based on the one-sided curvature cannot represent the cusp.
-      # Leave uncertainty unavailable here; the conditional MAP remains valid.
-      covariance[, , g] <- NA_real_
-    } else if (common$has_condition) {
+    if (common$has_condition) {
       covariance[, , g] <- tryCatch(
         solve(information),
         error = function(e) {
-          eigen_result <- eigen(information, symmetric = TRUE)
-          eigen_result$vectors %*%
-            diag(1 / pmax(eigen_result$values, 1e-10), 2L) %*%
-            t(eigen_result$vectors)
+          tf_em_stop("Cannot invert posterior information for `%s`; no numerical floor is added.",
+                      common$target_genes[[g]])
         }
       )
     } else {
       covariance[, , g] <- matrix(0, 2L, 2L)
-      covariance[1L, 1L, g] <- 1 / pmax(information[1L, 1L], 1e-10)
+      covariance[1L, 1L, g] <- 1 / information[1L, 1L]
     }
   }
   list(
@@ -573,21 +589,17 @@ tf_em_mstep <- function(common, eta0, phi, estep, beta_mean, beta_delta, setting
     convergence = convergence,
     branch_convergence = branch_convergence,
     at_prior_kink = at_prior_kink,
-    uncertainty_method = ifelse(at_prior_kink, "unavailable_at_prior_kink",
-      "local_complete_data_normal_not_full_posterior"),
+    uncertainty_method = rep("local_complete_data_normal_not_full_posterior", G),
     objective = objective
   )
 }
 
 tf_em_beta_log_prior <- function(beta_mean, beta_delta, common) {
-  result <- sum(ifelse(beta_mean >= 0,
-    -common$beta_lambda_positive * beta_mean,
-    common$beta_lambda_negative * beta_mean))
-  if (common$has_condition) {
-    result <- result +
-      sum(-0.5 * (beta_delta / common$target_interaction_sd) ^ 2)
-  }
-  result
+  sum(vapply(seq_along(beta_mean), function(g) {
+    difference <- c(beta_mean[[g]] - common$beta_prior_mean[[g]],
+      if (common$has_condition) beta_delta[[g]] - common$beta_delta_prior_mean[[g]] else 0)
+    -0.5 * sum(difference * (tf_em_gene_prior_information(common, g) %*% difference))
+  }, numeric(1)))
 }
 
 tf_em_relative_change <- function(new, old, epsilon = 1e-8) {
@@ -601,13 +613,11 @@ tf_em_scaled_beta_change <- function(
   old_delta,
   common
 ) {
-  prior_sd <- sqrt(1 / common$beta_lambda_positive ^ 2 +
-                     1 / common$beta_lambda_negative ^ 2)
-  changes <- abs(new_mean - old_mean) / prior_sd
+  changes <- abs(new_mean - old_mean) / common$beta_prior_sd
   if (common$has_condition) {
     changes <- c(
       changes,
-      abs(new_delta - old_delta) / common$target_interaction_sd
+      abs(new_delta - old_delta) / common$beta_delta_prior_sd
     )
   }
   max(changes)
@@ -1239,7 +1249,8 @@ tf_em_summarize_draw_results <- function(draw_results, common, settings) {
     beta_mean_local_normal_sample_by_draw = beta_mean_sample,
     beta_delta_local_normal_sample_by_draw = beta_delta_sample,
     # Legacy field names retained as aliases; these are local normal heuristics,
-    # not samples from the asymmetric-Laplace joint posterior.
+    # not samples from the full joint posterior. Here "Laplace" names the
+    # historical local approximation, not the coefficient-prior family.
     beta_mean_laplace_sample_by_draw = beta_mean_sample,
     beta_delta_laplace_sample_by_draw = beta_delta_sample
   )
@@ -1268,7 +1279,9 @@ tf_em_summarize_draw_results <- function(draw_results, common, settings) {
 #' positive-activity conditionals, an auxiliary slab variable for the zero
 #' spike, and a joint coefficient/activity scale Metropolis move. Warmup and
 #' retained iterations each default to 1000. Stage 2 target-beta posterior means
-#' initialize the sampler and the network asymmetric-Laplace prior is retained.
+#' initialize the sampler. A joint Normal approximation to their Stage 2
+#' posterior supplies the coefficient prior, retaining beta/delta covariance
+#' without variance inflation or a variance floor.
 #' One chain is run per nuisance component, so convergence is reported as
 #' unknown, with within-chain ESS and proposal acceptance diagnostics.
 #' Set `algorithm = "quadrature_em"` for the conditional-MAP EM implementation
@@ -1417,9 +1430,13 @@ run_TF_EM_latent_activity <- function(
     beta_mean_init = as.numeric(stage2_input$beta_target_mean_init),
     beta_delta_init = as.numeric(stage2_input$beta_target_delta_init),
     beta_prior_family = stage2_input$beta_prior_family,
-    beta_lambda_positive = as.numeric(stage2_input$beta_lambda_positive),
-    beta_lambda_negative = as.numeric(stage2_input$beta_lambda_negative),
-    target_interaction_sd = as.numeric(stage2_input$target_interaction_sd),
+    beta_prior_mean = as.numeric(stage2_input$beta_prior_mean),
+    beta_prior_variance = as.numeric(stage2_input$beta_prior_variance),
+    beta_prior_sd = as.numeric(stage2_input$beta_prior_sd),
+    beta_delta_prior_mean = as.numeric(stage2_input$beta_delta_prior_mean),
+    beta_delta_prior_variance = as.numeric(stage2_input$beta_delta_prior_variance),
+    beta_delta_prior_sd = as.numeric(stage2_input$beta_delta_prior_sd),
+    beta_delta_prior_covariance = as.numeric(stage2_input$beta_delta_prior_covariance),
     cell_names = stage2_input$cell_names,
     target_genes = stage2_input$target_genes,
     control_level = stage2_input$control_level,
@@ -1429,15 +1446,18 @@ run_TF_EM_latent_activity <- function(
   settings <- list(
     algorithm = algorithm,
     algorithm_version = if (identical(algorithm, "gibbs_ars")) {
-      "knowledge_asymmetric_laplace_gibbs_ars_v1"
-    } else "knowledge_asymmetric_laplace_em_v2",
+      "stage2_posterior_normal_gibbs_ars_v3"
+    } else "stage2_posterior_normal_em_v4",
     iter_warmup = iter_warmup,
     iter_sampling = iter_sampling,
     scale_move_sd = scale_move_sd,
-    beta_prior_family = "laplace",
+    beta_prior_family = "normal",
+    beta_prior_source = stage2_input$beta_prior_source,
+    beta_prior_variance_inflation = 1,
+    beta_prior_variance_floor = 0,
     beta_uncertainty = if (identical(algorithm, "gibbs_ars")) {
       "empirical_conditional_joint_posterior"
-    } else "local_complete_data_normal_not_full_posterior; unavailable_at_prior_kink",
+    } else "local_complete_data_normal_not_full_posterior",
     quadrature_nodes = quadrature_nodes,
     max_iter = max_iter,
     min_iter = min_iter,
@@ -1473,8 +1493,14 @@ run_TF_EM_latent_activity <- function(
     stage2_input$G,
     stage2_input$S,
     stage2_input$beta_prior_family,
-    paste(format(stage2_input$beta_lambda_positive, digits = 17), collapse = ","),
-    paste(format(stage2_input$beta_lambda_negative, digits = 17), collapse = ","),
+    stage2_input$beta_prior_source,
+    paste(format(stage2_input$beta_prior_mean, digits = 17), collapse = ","),
+    paste(format(stage2_input$beta_prior_variance, digits = 17), collapse = ","),
+    paste(format(stage2_input$beta_prior_sd, digits = 17), collapse = ","),
+    paste(format(stage2_input$beta_delta_prior_mean, digits = 17), collapse = ","),
+    paste(format(stage2_input$beta_delta_prior_variance, digits = 17), collapse = ","),
+    paste(format(stage2_input$beta_delta_prior_sd, digits = 17), collapse = ","),
+    paste(format(stage2_input$beta_delta_prior_covariance, digits = 17), collapse = ","),
     paste(stage2_input$target_genes, collapse = ","),
     nuisance_mode,
     nuisance_draw_count,
@@ -1641,8 +1667,8 @@ run_TF_EM_latent_activity <- function(
   summarized <- tf_em_summarize_draw_results(draw_results, common, settings)
   result <- c(list(
     interface_version = if (identical(algorithm, "gibbs_ars")) {
-      "tf_em_latent_activity_fit_v3"
-    } else "tf_em_latent_activity_fit_v2",
+      "tf_em_latent_activity_fit_v5"
+    } else "tf_em_latent_activity_fit_v4",
     algorithm = algorithm,
     target_tf = stage2_input$target_tf,
     has_condition = isTRUE(stage2_input$has_condition),

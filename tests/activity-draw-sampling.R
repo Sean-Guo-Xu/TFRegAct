@@ -20,7 +20,7 @@ fake_fit <- list(
                                      ess_bulk = 1000, ess_tail = 1000)
 )
 handoff <- ns$tf_stage1_screening_summarize_fit(
-  fake_fit, entry, 'mcmc', NULL, 'laplace', 0.9, 0.9
+  fake_fit, entry, 'mcmc', NULL, 'normal', 0.9, 0.9
 )$stage2_parameter_draws
 stopifnot(handoff$draw_count == 1800L,
           identical(handoff$source_draw_index, seq_len(1800)),
@@ -28,14 +28,17 @@ stopifnot(handoff$draw_count == 1800L,
 
 # Exercise actual conditional EM runs on a small synthetic input.
 input <- list(
-  interface_version = 'tf_em_stage2_input_v4', N = 2L, G = 1L, S = 1800L,
+  interface_version = 'tf_em_stage2_input_v6', N = 2L, G = 1L, S = 1800L,
   Y = matrix(c(1, 3), 2, 1),
   eta0_draws = array(rep(seq(-0.1, 0.1, length.out = 1800), 2), c(1800, 2, 1)),
   phi_draws = matrix(5, 1800, 1), has_condition = FALSE, condition = c(0L, 0L),
   target_tf_expression = c(0, 1), target_tf_center = 0, target_tf_scale = 1,
   beta_target_mean_init = 0.2, beta_target_delta_init = 0,
-  beta_prior_family = 'laplace', beta_lambda_positive = 1,
-  beta_lambda_negative = 3, target_interaction_sd = 1,
+  beta_prior_family = 'normal', beta_prior_source = 'stage2_posterior_normal_approximation',
+  beta_prior_mean = 0.4, beta_prior_variance = 1, beta_prior_sd = 1,
+  beta_delta_prior_mean = 0, beta_delta_prior_variance = 0,
+  beta_delta_prior_sd = 0, beta_delta_prior_covariance = 0,
+  target_interaction_sd = 1,
   cell_names = c('c1', 'c2'), target_genes = 'Y', target_tf = 'T'
 )
 run <- function(...) ns$run_TF_EM_latent_activity(

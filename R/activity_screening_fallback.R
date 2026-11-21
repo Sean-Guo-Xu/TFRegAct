@@ -25,7 +25,8 @@ tf_screening_target_draws <- function(model, gene, inference, sampling = NULL) {
     legacy <- model$stage2_parameter_draws
     count <- legacy$draw_count
     complete <- is.list(legacy) &&
-      identical(legacy$interface_version, "tf_em_stage2_parameter_draws_v2") &&
+      (identical(legacy$interface_version, "tf_em_stage2_parameter_draws_v2") ||
+       identical(legacy$interface_version, "tf_em_stage2_parameter_draws_v3")) &&
       valid_count(count, 2L) && valid_count(source_count, 2L) && count == source_count &&
       length(legacy$source_draw_index) == count &&
       is.numeric(legacy$source_draw_index) &&

@@ -81,6 +81,7 @@ run_TF_stage2_hierarchical_model <- function(
   fields <- c("N", "P", "Y", "X", "log_offset", "S", "sample_id",
     "has_condition", "sample_condition", "use_target_interaction", "target_tf_index",
     "Q", "W", "W_prior_scale", "confidence", "direction", "gamma", "eta", "r_dir", "alpha_prior_sd",
+    "beta_prior_mean", "beta_prior_sd",
     "target_interaction_sd", "sample_intercept_sd_scale", "sample_slope_sd_scale", "save_log_lik")
   stan_file <- .tfregact_stan_file("TF_stage2_hierarchical_nb_model.stan")
   model <- tf_get_cmdstan_model(stan_file, force_recompile, include_log_lik = TRUE)

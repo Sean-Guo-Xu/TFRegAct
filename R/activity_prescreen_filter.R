@@ -324,11 +324,12 @@ build_TF_mcmc_input_from_prescreen <- function(
       )
     }
     stage1_summary <- stage1_table[stage1_index, , drop = FALSE]
-    # Retain the original, predictor-aligned knowledge prior. Stage 1 posterior
-    # means initialize sampling only; neither posterior means nor SDs set priors.
+    # Construct the predictor-aligned Normal prior from network confidence and
+    # direction only. Stage 1 posterior means initialize sampling only.
     stage2_prior <- tf_stage2_knowledge_prior(entry$stan_data)
-    entry$stan_data$beta_prior_mean <- NULL
-    entry$stan_data$beta_prior_sd <- NULL
+    entry$stan_data$beta_prior_mean <- stage2_prior$beta_prior_mean
+    entry$stan_data$beta_prior_sd <- stage2_prior$beta_prior_sd
+    entry$stan_data$beta_prior_variance <- stage2_prior$beta_prior_variance
     entry$stan_data$beta_init <- as.numeric(stage1_summary$beta_mean)
     entry$stan_data$alpha_prior_sd <- as.numeric(alpha_prior_sd)
     entry$stage1_beta_summary <- data.frame(
@@ -340,11 +341,12 @@ build_TF_mcmc_input_from_prescreen <- function(
     )
     entry$stage2_prior <- data.frame(
       tf = entry$feature_names,
-      prior_family = "laplace",
+      prior_family = "normal",
       confidence = stage2_prior$confidence,
       direction = stage2_prior$direction,
-      beta_lambda_positive = stage2_prior$beta_lambda_positive,
-      beta_lambda_negative = stage2_prior$beta_lambda_negative,
+      beta_prior_mean = stage2_prior$beta_prior_mean,
+      beta_prior_variance = stage2_prior$beta_prior_variance,
+      beta_prior_sd = stage2_prior$beta_prior_sd,
       stringsAsFactors = FALSE
     )
     entry$stage2_knowledge_prior <- stage2_prior
@@ -364,7 +366,7 @@ build_TF_mcmc_input_from_prescreen <- function(
   }
   class(result) <- unique(c("TFMCMCInputFromPrescreen", class(screening_input)))
   attr(result, "pipeline_stage") <- "mcmc_input"
-  attr(result, "prior_family") <- "laplace"
+  attr(result, "prior_family") <- "normal"
   attr(result, "prescreen_prior_family") <- "laplace"
   attr(result, "prescreen_target_interval") <-
     attr(prescreen_filtered_results, "target_interval")
@@ -377,8 +379,11 @@ build_TF_mcmc_input_from_prescreen <- function(
   attr(result, "model_version") <- tf_shared_stage2_model_version()
   attr(result, "stan_file") <- "TF_stage2_directional_nb_model.stan"
   attr(result, "stage2_prior_config") <- list(
-    prior_family = "laplace",
-    prior_source = "stage1_knowledge_prior",
+    prior_family = "normal",
+    prior_source = "network_confidence_direction",
+    confidence_min = 1, confidence_max = 10,
+    mean_baseline = 0.2, mean_increment = 0.4,
+    variance_baseline = 0.5, variance_increment = 1.5,
     alpha_prior_sd = as.numeric(alpha_prior_sd)
   )
 

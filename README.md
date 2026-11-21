@@ -78,9 +78,9 @@ edge_fit$direction_summary
 
 The conditioned single-cell model centers retained TF predictors within each
 biological sample and estimates sample-specific intercepts and focal-TF slopes.
-It keeps the original Stage 1 and reuses its confidence-weighted directional
-Laplace coefficient priors in Stage 2. Stage 1 posterior summaries are used for
-screening and initialization, not to construct new priors. Each condition must
+Stage 1 retains its confidence-weighted directional Laplace prior; Stage 2 uses
+network-informed Normal coefficient priors. Stage 1 posterior summaries are used
+for screening and initialization, not to construct the Stage 2 prior. Each condition must
 have at least two biological samples with within-sample focal-TF variation. Missing sample IDs, samples
 spanning conditions, and a rank-deficient condition/batch design are rejected.
 
@@ -154,29 +154,31 @@ hits; the largest R-hat among the checked parameters was 1.0059.
 Stage 1 removed all five adjustment TFs in that run, so a separate synthetic
 two-predictor fit checked the hierarchical model with retained covariates.
 These are historical execution and sampler checks, not evidence of biological
-accuracy or validation of the current directional-Laplace Stage 2 model. The
+accuracy or validation of the current network-informed Normal Stage 2 model. The
 current model requires its own sampler diagnostics.
 
-For the current knowledge-prior implementation,
+For the knowledge-prior implementation,
 `dev/validate_stage2_knowledge_prior.R` runs a reproducible synthetic check with
 96 observations from eight biological samples and two retained TF predictors.
-Stage 1 and the non-interaction, interaction and hierarchical Stage 2 routes
-each used two chains with 300 warmup and 500 sampling iterations, and retained
-identical nondefault knowledge-prior parameters. All chains completed with no
-divergent transitions or maximum-tree-depth hits. The largest checked R-hat
-was 1.0134 in the hierarchical fit; this small execution check does not establish
-full convergence or biological accuracy.
+It checks Stage 1 and the non-interaction, interaction and hierarchical Stage 2
+routes. Historical runs with the preceding directional-Laplace Stage 2 model
+used two chains with 300 warmup and 500 sampling iterations per model. Those
+runs had no divergent transitions or maximum-tree-depth hits, and the largest
+checked R-hat was 1.0134. These historical checks do not validate the current
+Normal prior or establish biological accuracy; rerun the script to assess the
+current implementation.
 
 `tests/regulatory-routing.R` checks all eight combinations of data type,
 condition availability and legacy Stage 2 choice, together with metadata
-alignment, biological-replicate guards and propagation of the original network
+alignment, biological-replicate guards and construction of the network-informed
 prior. It uses model substitutes for the dispatch checks and does not require
 MCMC or private data.
 
 `tests/stage2-knowledge-prior.R`, `tests/activity-knowledge-prior.R` and
-`tests/stage3-knowledge-prior.R` check predictor alignment, posterior-independent
-prior parameters, the Stage 2/3 handoff, deprecated options, cache invalidation,
-and asymmetric-Laplace EM optimization including beta = 0.
+`tests/stage3-knowledge-prior.R` check predictor alignment, network-derived
+Stage 2 priors, posterior-calibrated Stage 3 priors, the Stage 2/3 handoff,
+deprecated options, cache invalidation, and smooth Gaussian-prior EM
+optimization, including beta = 0.
 
 ## Basic usage: cell-level TF activity
 
@@ -208,21 +210,48 @@ default and also supports mean-field or full-rank variational inference.
 The subsequent activity MCMC and
 non-hierarchical regulatory Stage 2 call the same negative-binomial Stan model
 and MCMC fitting function. Conditioned single-cell regulatory Stage 2 instead
-uses the sample hierarchy. In both workflows, Stage 2 retains the original
-Stage 1 coefficient prior: the same confidence, direction, base scale,
-confidence exponent and opposing-direction penalty define a zero-mode
-directional Laplace distribution. Stage 1 posterior summaries support screening
-and initialize the refit; they do not define Stage 2 priors. Stage 2 refits the
-retained model using the original prior and the expression likelihood.
-Stage 3 retains this directional Laplace prior for focal-TF coefficients.
+uses the sample hierarchy. In both workflows, Stage 2 assigns a
+network-informed Normal prior to each retained regulatory coefficient:
+
+```text
+q = (min(10, max(confidence, 1)) - 1) / 9
+prior_mean = direction * (0.2 + 0.4 * q)
+prior_variance = 0.5 + 1.5 * q
+beta ~ Normal(prior_mean, sqrt(prior_variance))
+```
+
+Direction is +1 for activation, -1 for repression, and 0 for unknown or mixed
+direction. The scale argument passed to Stan is the standard deviation.
+Variance increases from 0.5 at confidence 1 to 2 at confidence 10;
+known-direction mean magnitudes increase from 0.2 to 0.6. The prior probability
+of the annotated sign rises from approximately 61.1% to 66.4%, while both signs
+retain support. These mappings remain anchored at confidence 1 when screening
+thresholds change. Stage 1 posterior summaries support screening and initialize
+the refit; network evidence directly determines Stage 2 prior parameters.
+Stage 3 instead uses a Gaussian approximation to the full Stage 2 coefficient
+posterior. For each target gene, it computes the sample mean vector and sample
+covariance of `(beta, delta)` from all post-warmup Stage 2 draws, before
+nuisance-draw subsampling. The joint Normal prior retains their posterior
+covariance and both posterior means, including a nonzero delta mean when
+supported by the Stage 2 fit. Without an interaction, it reduces to the
+univariate Normal approximation for beta. The covariance is used directly,
+without standard-deviation inflation or an added variance floor. Confidence
+and direction already inform this distribution through Stage 2.
+
 Its default Rcpp Gibbs sampler uses adaptive rejection sampling (ARS) for
-coefficients and positive activity. Interaction and
-nuisance-parameter priors are unchanged. The former prior-transfer arguments
+coefficients and positive activity. Stage 3 revisits the same expression data
+under this fitted coefficient prior, so its inference is a posterior-calibrated
+conditional approximation rather than an update with independent data.
+The former prior-transfer arguments
 `direction_effect`, `beta_sd_floor`, and `stage1_sd_multiplier` are deprecated,
 default to `NULL`, and non-`NULL` values are ignored with a warning.
-Do not reuse Stage 2 or Stage 3 fits or checkpoints from the former Normal-prior
-workflow; refit them under the current prior (use `force_refit = TRUE` for an
-existing activity output directory). Set `condition_column = NULL` to
+Stage 2 fits from the preceding directional-Laplace or earlier Normal model
+must be refitted under the current network-informed prior. Current Stage 2
+fits can be reused when they retain the complete coefficient posterior
+summaries needed for calibration. Stage 3 uses input interface
+`tf_em_stage2_input_v6`, with
+`beta_prior_source = "stage2_posterior_normal_approximation"`; older Stage 3
+fits and checkpoints are invalidated. Set `condition_column = NULL` to
 run the entire activity pipeline without condition effects or TF-by-condition
 interactions; Stage 3 then reports overall cell activity and omits the
 control-versus-disease contrast tables.
@@ -254,9 +283,13 @@ replacement from the retained Stage 2 posterior. Workers divide those fits,
 and the cell-level score averages their conditional posterior activity means.
 
 Set `em_algorithm = "quadrature_em"` to explicitly use the previous integration
-and conditional-MAP EM algorithm. Its sign-constrained M-step compares the
-positive and negative beta half-axes with zero. Local curvature intervals are
-missing at the Laplace prior kink. The `max_iter` control applies to this
+and conditional-MAP EM algorithm. Its M-step optimizes signed coefficients
+under a smooth joint Gaussian log prior, using the full inverse covariance in
+its gradients and curvature. Convergence scales each coefficient change by
+its marginal Stage 2 posterior SD. Local curvature summaries include
+the Gaussian prior curvature and remain defined at beta = 0 when the fitted
+curvature is nonsingular. They are not full joint posterior intervals.
+The `max_iter` control applies to this
 algorithm, and the two `em_iter_*` sampling counts apply to `gibbs_ars`.
 
 Stage 2 distributes genes across `cores` worker processes. Each worker handles
@@ -351,9 +384,9 @@ when diagnostics indicate a problem.
 | `adjustment_search_cores` | `4` | Compatibility argument for single-query search; the minimum-cut solver uses one core. |
 | `max_adjustment_sets` | `NULL` | Deprecated compatibility argument; ignored by minimum-cut search. |
 | `dagitty_beta` | `2` | Relative weight given to confidence on paths towards the target gene when adjustment sets are scored. |
-| `gamma` | `1` | Base beta-prior scale used by both stages. This is the regulatory-interface counterpart of activity `beta_prior_scale`. |
-| `eta` | `0.5` | Exponent controlling how strongly confidence changes the beta-prior scale in both stages. |
-| `r_dir` | `3` | Additional shrinkage ratio on effects opposing the network direction in both stages. |
+| `gamma` | `1` | Stage 1 directional-Laplace beta-prior scale, corresponding to activity `beta_prior_scale`. Stage 2 uses the fixed network-informed Normal mapping above. |
+| `eta` | `0.5` | Exponent controlling how confidence changes the Stage 1 beta-prior scale. |
+| `r_dir` | `3` | Stage 1 shrinkage ratio on effects opposing the network direction. |
 | `nuisance_prior_scale` | `1` | Normal-prior scale for available condition and batch columns in the nuisance design matrix. A scalar or one value per column is accepted. |
 | `confidence_min` | `1` | Lower bound applied to network confidence. |
 | `confidence_max` | `10` | Upper bound applied to network confidence. |
@@ -380,7 +413,7 @@ when diagnostics indicate a problem.
 | `direction_effect` | `NULL` | Deprecated compatibility argument; non-`NULL` values are ignored with a warning. |
 | `beta_sd_floor` | `NULL` | Deprecated compatibility argument; non-`NULL` values are ignored with a warning. |
 | `stage1_sd_multiplier` | `NULL` | Deprecated compatibility argument; non-`NULL` values are ignored with a warning. |
-| `target_interaction_sd` | `0.5` | Prior SD for the target-TF-by-condition interaction. |
+| `target_interaction_sd` | `0.5` | Stage 2 prior SD for the target-TF-by-condition interaction when the selected regulatory model includes it. |
 | `stage2_chains` | `3` | Stage 2 MCMC chains. |
 | `stage2_iter_warmup` | `500` | Warmup iterations per Stage 2 chain. |
 | `stage2_iter_sampling` | `900` | Retained iterations per Stage 2 chain. |
@@ -429,11 +462,11 @@ when diagnostics indicate a problem.
 | `adjustment_search_starts` | `1` | Compatibility argument; ignored. Exact minimum-cut search runs once per target gene. Activity `cores` still parallelizes different target genes. |
 | `max_adjustment_sets` | `NULL` | Deprecated compatibility argument; ignored by minimum-cut search. |
 | `dagitty_beta` | `2` | Relative weight given to confidence on paths towards each target gene. |
-| `beta_prior_scale` | `1` | Base directional-Laplace beta-prior scale shared by all three stages. |
-| `eta` | `0.5` | Exponent controlling how strongly confidence changes the beta-prior scale in all three stages. |
-| `r_dir` | `3` | Additional shrinkage ratio on effects opposing the network direction in all three stages. |
+| `beta_prior_scale` | `1` | Base directional-Laplace beta-prior scale in Stage 1. Stage 2 uses the fixed network-informed Normal mapping; Stage 3 uses the Stage 2 posterior Gaussian approximation. |
+| `eta` | `0.5` | Exponent controlling how confidence changes the Stage 1 beta-prior scale. |
+| `r_dir` | `3` | Stage 1 shrinkage ratio on effects opposing the network direction. |
 | `batch_prior_scale` | `1` | Normal-prior scale for batch contrasts. |
-| `target_interaction_sd` | `0.5` | Prior SD for the target-TF-by-condition interaction. |
+| `target_interaction_sd` | `0.5` | Stage 1/2 prior SD for the target-TF-by-condition interaction. Stage 3 uses its joint Stage 2 posterior covariance with beta. |
 | `predictor_sd_min` | `1e-8` | Predictors with an SD at or below this value are treated as non-informative. |
 | `standardize_predictors` | `TRUE` | Standardize TF predictors before regression. |
 | `prescreen_target_interval` | `0.90` | Stage 1 interval used to retain target-gene models supported in at least one condition. |
@@ -516,7 +549,7 @@ activity_fit <- TF_activity_computation(
 After activity inference, optionally smooth scores and plot the result.
 The figures below were generated with the earlier posterior-informed Normal
 Stage 2 model and are retained as plotting examples. Regenerate activity under
-the current directional-Laplace model before using them as current results.
+the current network-informed Normal model before using them as current results.
 
 <!-- smoothing-example:start -->
 ```r

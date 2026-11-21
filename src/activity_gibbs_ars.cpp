@@ -61,8 +61,8 @@ double sample_tangent(double slope, double left, double right) {
 }
 
 // Adaptive rejection sampling uses an upper envelope of supporting tangents.
-// A one-sided derivative at beta=0 is a valid supergradient of the concave AL
-// log density. The cusp therefore needs no smoothing or Gaussian replacement.
+// Both the Normal coefficient prior and negative-binomial coefficient
+// likelihood are smooth and log-concave on the full real line.
 double sample_log_concave(
   const std::function<DensityPoint(double)>& density,
   double initial, double scale, double lower, SamplerCounters& counters
@@ -198,9 +198,52 @@ Rcpp::List tf_activity_gibbs_ars_cpp(
   const Rcpp::NumericVector anchor = common["activity_anchor"];
   const Rcpp::NumericVector shift = common["condition_shift"];
   const Rcpp::NumericVector probability = common["active_prior_probability"];
-  const Rcpp::NumericVector lambda_positive = common["beta_lambda_positive"];
-  const Rcpp::NumericVector lambda_negative = common["beta_lambda_negative"];
-  const Rcpp::NumericVector interaction_sd = common["target_interaction_sd"];
+  const Rcpp::NumericVector prior_mean = common["beta_prior_mean"];
+  const Rcpp::NumericVector prior_variance = common["beta_prior_variance"];
+  const Rcpp::NumericVector prior_sd = common["beta_prior_sd"];
+  const Rcpp::NumericVector delta_prior_mean = common["beta_delta_prior_mean"];
+  const Rcpp::NumericVector delta_prior_variance = common["beta_delta_prior_variance"];
+  const Rcpp::NumericVector delta_prior_sd = common["beta_delta_prior_sd"];
+  const Rcpp::NumericVector prior_covariance = common["beta_delta_prior_covariance"];
+  if (prior_mean.size() != genes || prior_variance.size() != genes ||
+      prior_sd.size() != genes || delta_prior_mean.size() != genes ||
+      delta_prior_variance.size() != genes || delta_prior_sd.size() != genes ||
+      prior_covariance.size() != genes)
+    Rcpp::stop("Normal prior metadata must contain one value per target gene.");
+  std::vector<double> precision_beta(genes), precision_delta(genes, 0),
+    precision_cross(genes, 0), conditional_beta_sd(genes), conditional_delta_sd(genes, 0);
+  for (int g = 0; g < genes; ++g) {
+    if (!std::isfinite(prior_mean[g]) || !std::isfinite(prior_variance[g]) ||
+        !std::isfinite(prior_sd[g]) || prior_variance[g] <= 0 || prior_sd[g] <= 0 ||
+        !std::isfinite(delta_prior_mean[g]) || !std::isfinite(delta_prior_variance[g]) ||
+        !std::isfinite(delta_prior_sd[g]) || !std::isfinite(prior_covariance[g]) ||
+        std::abs(prior_sd[g] * prior_sd[g] - prior_variance[g]) >
+          1e-10 * prior_variance[g])
+      Rcpp::stop("Stage 2 posterior Normal mean, variance or SD metadata are inconsistent.");
+    precision_beta[g] = 1 / prior_variance[g];
+    if (has_condition) {
+      if (delta_prior_variance[g] <= 0 || delta_prior_sd[g] <= 0 ||
+          std::abs(delta_prior_sd[g] * delta_prior_sd[g] - delta_prior_variance[g]) >
+            1e-10 * delta_prior_variance[g])
+        Rcpp::stop("Condition-enabled Stage 3 requires a positive delta posterior variance and matching SD.");
+      const double correlation = prior_covariance[g] / (prior_sd[g] * delta_prior_sd[g]);
+      if (!std::isfinite(correlation) || std::abs(correlation) >= 1)
+        Rcpp::stop("Stage 2 beta/delta posterior covariance must be positive definite; no jitter is added.");
+      const double remaining = 1 - correlation * correlation;
+      precision_beta[g] /= remaining;
+      precision_delta[g] = 1 / (delta_prior_variance[g] * remaining);
+      precision_cross[g] = -correlation / (prior_sd[g] * delta_prior_sd[g] * remaining);
+      conditional_delta_sd[g] = 1 / std::sqrt(precision_delta[g]);
+    } else if (delta_prior_mean[g] != 0 || delta_prior_variance[g] != 0 ||
+               delta_prior_sd[g] != 0 || prior_covariance[g] != 0) {
+      Rcpp::stop("Condition-free Stage 3 delta posterior moments must be zero.");
+    }
+    conditional_beta_sd[g] = 1 / std::sqrt(precision_beta[g]);
+    if (!std::isfinite(precision_beta[g]) || !std::isfinite(precision_delta[g]) ||
+        !std::isfinite(precision_cross[g]) || conditional_beta_sd[g] <= 0 ||
+        (has_condition && conditional_delta_sd[g] <= 0))
+      Rcpp::stop("Stage 2 posterior precision is not numerically finite; no variance floor is added.");
+  }
   Rcpp::NumericVector beta = Rcpp::clone(Rcpp::as<Rcpp::NumericVector>(common["beta_mean_init"]));
   Rcpp::NumericVector delta = Rcpp::clone(Rcpp::as<Rcpp::NumericVector>(common["beta_delta_init"]));
   const double sigma = Rcpp::as<double>(common["sigma_activity"]);
@@ -243,9 +286,11 @@ Rcpp::List tf_activity_gibbs_ars_cpp(
       const Rcpp::NumericVector& delta_value, const Rcpp::NumericVector& activity_value) {
     double result = 0;
     for (int g = 0; g < genes; ++g) {
-      result += beta_value[g] >= 0 ? -lambda_positive[g] * beta_value[g] :
-        lambda_negative[g] * beta_value[g];
-      if (has_condition) result -= 0.5 * std::pow(delta_value[g] / interaction_sd[g], 2);
+      const double beta_difference = beta_value[g] - prior_mean[g];
+      const double delta_difference = has_condition ? delta_value[g] - delta_prior_mean[g] : 0;
+      result -= 0.5 * (precision_beta[g] * beta_difference * beta_difference +
+        2 * precision_cross[g] * beta_difference * delta_difference +
+        precision_delta[g] * delta_difference * delta_difference);
     }
     for (int i = 0; i < cells; ++i) {
       result += cell_likelihood(i, activity_value[i], beta_value, delta_value);
@@ -262,10 +307,15 @@ Rcpp::List tf_activity_gibbs_ars_cpp(
     Rcpp::checkUserInterrupt();
     for (int g = 0; g < genes; ++g) {
       auto coefficient_density = [&](double value, bool interaction) {
-        double log_density = interaction ? -0.5 * std::pow(value / interaction_sd[g], 2) :
-          (value >= 0 ? -lambda_positive[g] * value : lambda_negative[g] * value);
-        double derivative = interaction ? -value / std::pow(interaction_sd[g], 2) :
-          (value >= 0 ? -lambda_positive[g] : lambda_negative[g]);
+        const double beta_difference = (interaction ? beta[g] : value) - prior_mean[g];
+        const double delta_difference = has_condition ?
+          (interaction ? value : delta[g]) - delta_prior_mean[g] : 0;
+        double log_density = -0.5 * (precision_beta[g] * beta_difference * beta_difference +
+          2 * precision_cross[g] * beta_difference * delta_difference +
+          precision_delta[g] * delta_difference * delta_difference);
+        double derivative = interaction ?
+          -precision_cross[g] * beta_difference - precision_delta[g] * delta_difference :
+          -precision_beta[g] * beta_difference - precision_cross[g] * delta_difference;
         for (int i = 0; i < cells; ++i) {
           const double beta_value = interaction ? beta[g] : value;
           const double delta_value = interaction ? value : delta[g];
@@ -277,14 +327,13 @@ Rcpp::List tf_activity_gibbs_ars_cpp(
         }
         return DensityPoint{value, log_density, derivative};
       };
-      const double beta_scale = std::hypot(1 / lambda_positive[g], 1 / lambda_negative[g]);
       beta[g] = sample_log_concave([&](double value) {
         return coefficient_density(value, false);
-      }, beta[g], beta_scale, R_NegInf, counters);
+      }, beta[g], conditional_beta_sd[g], R_NegInf, counters);
       if (has_condition) {
         delta[g] = sample_log_concave([&](double value) {
           return coefficient_density(value, true);
-        }, delta[g], interaction_sd[g], R_NegInf, counters);
+        }, delta[g], conditional_delta_sd[g], R_NegInf, counters);
       }
     }
     for (int i = 0; i < cells; ++i) {

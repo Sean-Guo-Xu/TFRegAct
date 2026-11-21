@@ -61,7 +61,7 @@ tf_stage1_screening_default_output <- function(screening_input, inference) {
     target_tf <- "target_TF"
   }
   suffix <- if (identical(attr(screening_input, "pipeline_stage"), "mcmc_input")) {
-    "stage2_laplace_mcmc_results.rds"
+    "stage2_normal_mcmc_results.rds"
   } else if (identical(inference, "mcmc")) {
     "stage1_screening_stage2_ready_results.rds"
   } else {
@@ -92,6 +92,10 @@ tf_stage1_screening_input_signature <- function(screening_input, ready_genes) {
       if (is.null(entry$stan_data$r_dir)) NA_real_ else entry$stan_data$r_dir,
       paste(signif(entry$stan_data$confidence, 12), collapse = ","),
       paste(entry$stan_data$direction, collapse = ","),
+      if (is.null(entry$stan_data$beta_prior_mean)) "not_used_in_stage1" else
+        paste(signif(entry$stan_data$beta_prior_mean, 12), collapse = ","),
+      if (is.null(entry$stan_data$beta_prior_sd)) "not_used_in_stage1" else
+        paste(signif(entry$stan_data$beta_prior_sd, 12), collapse = ","),
       entry$stan_data$target_interaction_sd,
       paste(entry$feature_names, collapse = ","),
       sep = "|"
@@ -191,7 +195,11 @@ tf_stage1_screening_validate_input <- function(screening_input) {
         gene
       )
     }
-    tf_stage2_knowledge_prior(entry$stan_data)
+    if (identical(attr(screening_input, "pipeline_stage"), "mcmc_input")) {
+      tf_validate_shared_stage2_data(entry$stan_data)
+    } else {
+      tf_stage1_knowledge_prior(entry$stan_data)
+    }
     has_condition <- identical(as.integer(entry$stan_data$has_condition), 1L)
     use_interaction <- identical(
       as.integer(entry$stan_data$use_target_interaction),
@@ -357,14 +365,25 @@ tf_stage1_screening_summarize_fit <- function(
   interval_lower <- interval_bounds[1L, ]
   interval_upper <- interval_bounds[2L, ]
 
-  knowledge_prior <- tf_stage2_knowledge_prior(entry$stan_data)
-  lambda_positive <- knowledge_prior$beta_lambda_positive
-  lambda_negative <- knowledge_prior$beta_lambda_negative
-  # These are descriptive Laplace moments, not Normal-prior hyperparameters.
-  prior_mean <- 1 / lambda_positive - 1 / lambda_negative
-  prior_sd <- sqrt(1 / lambda_positive ^ 2 + 1 / lambda_negative ^ 2)
-  prior_scale <- entry$stan_data$gamma *
-    (pmax(entry$stan_data$confidence, 1) / 10) ^ entry$stan_data$eta
+  knowledge_prior <- if (identical(prior_family, "normal")) {
+    tf_stage2_knowledge_prior(entry$stan_data)
+  } else {
+    tf_stage1_knowledge_prior(entry$stan_data)
+  }
+  if (identical(prior_family, "normal")) {
+    prior_mean <- knowledge_prior$beta_prior_mean
+    prior_sd <- knowledge_prior$beta_prior_sd
+    prior_variance <- knowledge_prior$beta_prior_variance
+    prior_scale <- prior_sd
+  } else {
+    lambda_positive <- knowledge_prior$beta_lambda_positive
+    lambda_negative <- knowledge_prior$beta_lambda_negative
+    # Stage 1 retains its asymmetric-Laplace prior and descriptive moments.
+    prior_mean <- 1 / lambda_positive - 1 / lambda_negative
+    prior_sd <- sqrt(1 / lambda_positive ^ 2 + 1 / lambda_negative ^ 2)
+    prior_variance <- 1 / lambda_positive ^ 2 + 1 / lambda_negative ^ 2
+    prior_scale <- knowledge_prior$beta_prior_scale
+  }
   parameter_table <- data.frame(
     variable = beta_variables,
     beta_index = seq_len(P),
@@ -377,8 +396,7 @@ tf_stage1_screening_summarize_fit <- function(
     prior_mean = as.numeric(prior_mean),
     prior_scale = as.numeric(prior_scale),
     prior_sd = as.numeric(prior_sd),
-    beta_lambda_positive = as.numeric(lambda_positive),
-    beta_lambda_negative = as.numeric(lambda_negative),
+    prior_variance = as.numeric(prior_variance),
     beta_mean = colMeans(beta_draws),
     beta_sd = apply(beta_draws, 2, stats::sd),
     beta_median = quantiles[, 3],
@@ -398,6 +416,10 @@ tf_stage1_screening_summarize_fit <- function(
       interval_lower > 0 | interval_upper < 0,
     stringsAsFactors = FALSE
   )
+  if (identical(prior_family, "laplace")) {
+    parameter_table$beta_lambda_positive <- as.numeric(lambda_positive)
+    parameter_table$beta_lambda_negative <- as.numeric(lambda_negative)
+  }
 
   target_quantiles <- t(apply(
     target_draws,
@@ -439,6 +461,10 @@ tf_stage1_screening_summarize_fit <- function(
   parameter_table$beta_control_interval_upper <- NA_real_
   parameter_table$beta_disease_interval_lower <- NA_real_
   parameter_table$beta_disease_interval_upper <- NA_real_
+  parameter_table$beta_mean_delta_covariance <- NA_real_
+  parameter_table$beta_mean_delta_covariance[is_target] <- if (entry$stan_data$has_condition == 1L) {
+    stats::cov(beta_draws[, entry$target_tf_index], target_draws[, 3L])
+  } else 0
   target_bounds <- vapply(seq_len(2L), function(j) {
     tf_stage1_screening_quantile_interval(target_draws[, j], target_interval)
   }, numeric(2L))
@@ -465,6 +491,7 @@ tf_stage1_screening_summarize_fit <- function(
   if (entry$stan_data$has_condition == 1L) {
     target_screening_draws$control <- as.numeric(target_draws[, 1L])
     target_screening_draws$disease <- as.numeric(target_draws[, 2L])
+    target_screening_draws$delta <- as.numeric(target_draws[, 3L])
   }
 
   retained_draw_count <- if (is.null(stage2_draw_count)) {
@@ -488,9 +515,9 @@ tf_stage1_screening_summarize_fit <- function(
     matrix(0, nrow = nrow(retained_draws), ncol = 0L)
   }
   stage2_parameter_draws <- list(
-    interface_version = "tf_em_stage2_parameter_draws_v2",
+    interface_version = "tf_em_stage2_parameter_draws_v3",
     prior_family = prior_family,
-    beta_prior_family = "laplace",
+    beta_prior_family = prior_family,
     source_draw_index = retained_draw_index,
     draw_count = length(retained_draw_index),
     alpha = as.numeric(retained_draws[, "alpha"]),
@@ -509,10 +536,29 @@ tf_stage1_screening_summarize_fit <- function(
     target_interaction_sd = as.numeric(
       entry$stan_data$target_interaction_sd
     ),
-    beta_lambda_positive = stats::setNames(lambda_positive, entry$feature_names),
-    beta_lambda_negative = stats::setNames(lambda_negative, entry$feature_names),
     knowledge_prior = knowledge_prior
   )
+  # Full-posterior moments are stored before any compact nuisance-draw budget.
+  # Adding these optional fields preserves the existing v3 Stage 2 contract.
+  stage2_parameter_draws$target_posterior_moments <- list(
+    interface_version = "tf_stage2_target_posterior_moments_v1",
+    source_draw_count = nrow(joint_draws),
+    beta_prior_mean = parameter_table$beta_mean[is_target],
+    beta_prior_variance = parameter_table$beta_sd[is_target] ^ 2,
+    beta_prior_sd = parameter_table$beta_sd[is_target],
+    beta_delta_prior_mean = if (entry$stan_data$has_condition == 1L) parameter_table$beta_delta_mean[is_target] else 0,
+    beta_delta_prior_variance = if (entry$stan_data$has_condition == 1L) parameter_table$beta_delta_sd[is_target] ^ 2 else 0,
+    beta_delta_prior_sd = if (entry$stan_data$has_condition == 1L) parameter_table$beta_delta_sd[is_target] else 0,
+    beta_delta_prior_covariance = parameter_table$beta_mean_delta_covariance[is_target]
+  )
+  if (identical(prior_family, "normal")) {
+    stage2_parameter_draws$beta_prior_mean <- stats::setNames(prior_mean, entry$feature_names)
+    stage2_parameter_draws$beta_prior_sd <- stats::setNames(prior_sd, entry$feature_names)
+    stage2_parameter_draws$beta_prior_variance <- stats::setNames(prior_variance, entry$feature_names)
+  } else {
+    stage2_parameter_draws$beta_lambda_positive <- stats::setNames(lambda_positive, entry$feature_names)
+    stage2_parameter_draws$beta_lambda_negative <- stats::setNames(lambda_negative, entry$feature_names)
+  }
 
   finite_rhat <- parameter_table$rhat[is.finite(parameter_table$rhat)]
   finite_bulk <- parameter_table$ess_bulk[is.finite(parameter_table$ess_bulk)]
@@ -709,7 +755,7 @@ run_TF_stage1_screening_regressions <- function(
   force_refit = FALSE,
   force_recompile = FALSE,
   inference = c("mcmc", "variational"),
-  prior_family = "laplace",
+  prior_family = NULL,
   target_interval = 0.90,
   confounder_interval = 0.90,
   variational_algorithm = c("meanfield", "fullrank"),
@@ -720,12 +766,17 @@ run_TF_stage1_screening_regressions <- function(
   parallel_chains = NULL
 ) {
   tf_stage1_screening_require_pkg("cmdstanr")
-  if (!identical(as.character(prior_family[[1]]), "laplace")) {
+  is_stage2 <- identical(attr(screening_input, "pipeline_stage"), "mcmc_input")
+  expected_prior_family <- if (is_stage2) "normal" else "laplace"
+  if (is.null(prior_family)) prior_family <- expected_prior_family
+  if (length(prior_family) != 1L ||
+      !identical(as.character(prior_family), expected_prior_family)) {
     tf_stage1_screening_stop(
-      "Stage 1 and Stage 2 require the knowledge Laplace prior; rebuild obsolete Normal-prior inputs."
+      "Stage %d requires the knowledge %s prior; rebuild incompatible saved inputs.",
+      if (is_stage2) 2L else 1L, expected_prior_family
     )
   }
-  prior_family <- "laplace"
+  prior_family <- expected_prior_family
   ready_genes <- tf_stage1_screening_validate_input(screening_input)
   if (!is.null(max_genes)) {
     max_genes <- suppressWarnings(as.integer(max_genes[[1]]))
@@ -1038,6 +1089,7 @@ run_TF_stage1_screening_regressions <- function(
         "tf_validate_shared_laplace_stage1_data",
         "tf_fit_shared_laplace_stage1",
         "tf_shared_stage2_stop",
+        "tf_stage1_knowledge_prior",
         "tf_stage2_knowledge_prior",
         "tf_shared_stage2_data_fields",
         "tf_validate_shared_stage2_data",

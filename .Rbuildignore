@@ -4,4 +4,5 @@
 ^\.agents$
 ^tests$
 ^dev$
+^adjustment_output$
 ^inst/stan/.*\.(exe|hpp)$

@@ -47,6 +47,15 @@
 #' Stage 3 defaults to one fit conditional on the Stage 2 nuisance posterior
 #' means. When Stage 2 draws are requested, workers divide the conditional
 #' fits and the cell-level score averages their posterior activity means.
+#' Stage 1 uses its directional Laplace screening prior. Stage 2 uses network
+#' Normal coefficient priors with mean `direction * (0.2 + 0.4 * q)` and
+#' variance `0.5 + 1.5 * q`, where `q = (clip(confidence, 1, 10) - 1) / 9`.
+#' Stage 3 uses a Normal approximation to the Stage 2 focal-coefficient
+#' posterior, retaining its posterior mean and variance without inflation.
+#' With condition enabled, the joint approximation also retains the
+#' beta/condition-interaction covariance. Nuisance parameters are fixed within
+#' a conditional fit, while the default sampler updates focal coefficients
+#' and cell activities jointly.
 #' @param cores Number of gene-model workers. Each worker processes one gene at
 #'   a time. Each MCMC stage can launch up to `cores * mcmc_parallel_chains`
 #'   chains. Stage 3 can fit up to `cores` selected posterior draws at a time.

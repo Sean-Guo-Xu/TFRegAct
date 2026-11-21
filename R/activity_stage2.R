@@ -4,13 +4,129 @@ tf_em_stage2_input_stop <- function(...) {
   stop(sprintf(...), call. = FALSE)
 }
 
+# Form the Stage 3 coefficient prior from the FULL Stage 2 posterior. Compact
+# nuisance draws may be thinned or selected independently and are never used
+# here. Legacy v3 fits retain full posterior summaries, allowing exact reuse.
+tf_stage2_posterior_normal_prior <- function(model, gene, has_condition) {
+  scalar <- function(value) is.numeric(value) && length(value) == 1L && is.finite(value)
+  valid_count <- function(value) scalar(value) && value >= 2 && value == trunc(value)
+  fail <- function(detail) tf_em_stage2_input_stop(
+    paste0("Cannot construct the Stage 3 posterior-Normal prior for `%s`: %s. ",
+           "Rebuild the handoff from complete Stage 2 posterior summaries/draws; ",
+           "refit Stage 2 only if its posterior is missing or degenerate. No variance floor or inflation is applied."),
+    gene, detail)
+  row <- model$target_tf
+  required <- c("beta_mean", "beta_sd", if (has_condition) c("beta_delta_mean", "beta_delta_sd"))
+  if (!is.data.frame(row) || nrow(row) != 1L || !all(required %in% names(row)) ||
+      !all(vapply(row[required], scalar, logical(1)))) fail("full target-coefficient summaries are incomplete")
+  summary_moments <- c(
+    beta_prior_mean = row$beta_mean,
+    beta_prior_variance = row$beta_sd ^ 2,
+    beta_prior_sd = row$beta_sd,
+    beta_delta_prior_mean = if (has_condition) row$beta_delta_mean else 0,
+    beta_delta_prior_variance = if (has_condition) row$beta_delta_sd ^ 2 else 0,
+    beta_delta_prior_sd = if (has_condition) row$beta_delta_sd else 0,
+    beta_delta_prior_covariance = 0
+  )
+  if (has_condition) {
+    if ("beta_mean_delta_covariance" %in% names(row) && scalar(row$beta_mean_delta_covariance)) {
+      summary_moments[["beta_delta_prior_covariance"]] <- row$beta_mean_delta_covariance
+    } else if (all(c("beta_control_sd", "beta_disease_sd") %in% names(row)) &&
+               scalar(row$beta_control_sd) && scalar(row$beta_disease_sd)) {
+      # Var(beta + delta/2) - Var(beta - delta/2) = 2 Cov(beta, delta).
+      summary_moments[["beta_delta_prior_covariance"]] <- (row$beta_disease_sd ^ 2 - row$beta_control_sd ^ 2) / 2
+    } else fail("full joint beta/delta covariance cannot be recovered")
+  }
+  moments <- summary_moments
+  moment_source <- "full_stage2_posterior_summary"
+  source_count <- model$diagnostics$posterior_draws
+  if (!valid_count(source_count)) source_count <- NA_real_
+  payload <- model$target_screening_draws
+  if (!is.null(payload)) {
+    count <- payload$draw_count
+    if (!identical(payload$interface_version, "tf_target_screening_draws_v1") || !valid_count(count) ||
+        !is.numeric(payload$overall) || length(payload$overall) != count || any(!is.finite(payload$overall))) {
+      fail("full target-posterior draws are incomplete")
+    }
+    if (is.finite(source_count) && source_count != count) fail("full posterior draw counts disagree")
+    source_count <- as.numeric(count)
+    beta <- as.numeric(payload$overall)
+    delta <- rep(0, count)
+    delta_draws_available <- !has_condition
+    if (has_condition) {
+      if (all(vapply(payload[c("control", "disease")], function(x) {
+        is.numeric(x) && length(x) == count && all(is.finite(x))
+      }, logical(1))) && all(c("control", "disease") %in% names(payload))) {
+        if (!is.null(payload$delta)) {
+          delta <- as.numeric(payload$delta)
+          delta_draws_available <- TRUE
+        } else {
+          joint <- model$stage2_parameter_draws
+          complete_joint <- identical(as.integer(joint$source_draw_index), seq_len(count)) &&
+            length(joint$beta_target_delta) == count && all(is.finite(joint$beta_target_delta))
+          delta <- if (complete_joint) as.numeric(joint$beta_target_delta) else as.numeric(payload$disease - payload$control)
+          delta_draws_available <- complete_joint
+        }
+      } else fail("full condition-specific target-posterior draws are incomplete")
+      if (length(delta) != count || any(!is.finite(delta))) fail("full beta/delta draws are incomplete")
+    }
+    beta_sd <- stats::sd(beta)
+    delta_sd <- if (has_condition) stats::sd(delta) else 0
+    moments <- c(beta_prior_mean = mean(beta), beta_prior_variance = beta_sd ^ 2, beta_prior_sd = beta_sd,
+                 beta_delta_prior_mean = if (has_condition) mean(delta) else 0,
+                 beta_delta_prior_variance = delta_sd ^ 2, beta_delta_prior_sd = delta_sd,
+                 beta_delta_prior_covariance = if (has_condition) stats::cov(beta, delta) else 0)
+    # Older Stan CSVs round generated control/disease coefficients separately.
+    # Their variance-difference covariance identity can differ at CSV precision
+    # from an available full beta/delta vector. This is an audit tolerance only;
+    # no posterior variance is inflated or floored.
+    audit_tolerance <- if (has_condition && !("beta_mean_delta_covariance" %in% names(row))) 1e-6 else 1e-10
+    if (!isTRUE(all.equal(unname(moments), unname(summary_moments), tolerance = audit_tolerance, scale = 1))) {
+      fail("full posterior draws and stored summaries disagree")
+    }
+    if (delta_draws_available) {
+      moment_source <- "full_stage2_target_draws"
+    } else {
+      # Complete delta means/SDs are already in the old full-posterior summary.
+      # Keep them exactly if the old compact nuisance bundle omitted draws.
+      moments <- summary_moments
+      moment_source <- "full_stage2_posterior_summary"
+    }
+  }
+  stored <- model$stage2_parameter_draws$target_posterior_moments
+  if (!is.null(stored)) {
+    stored_values <- unlist(stored[names(moments)], use.names = FALSE)
+    if (!identical(stored$interface_version, "tf_stage2_target_posterior_moments_v1") ||
+        !valid_count(stored$source_draw_count) || length(stored_values) != length(moments) ||
+        !isTRUE(all.equal(as.numeric(stored_values), unname(moments), tolerance = 1e-8)) ||
+        (is.finite(source_count) && stored$source_draw_count != source_count)) {
+      fail("full posterior moment metadata disagree")
+    }
+    source_count <- as.numeric(stored$source_draw_count)
+  }
+  if (any(!is.finite(moments)) || moments[["beta_prior_sd"]] <= 0 ||
+      moments[["beta_prior_variance"]] <= 0) fail("the beta posterior variance is not positive")
+  if (has_condition) {
+    joint <- matrix(c(moments[["beta_prior_variance"]], moments[["beta_delta_prior_covariance"]],
+                      moments[["beta_delta_prior_covariance"]], moments[["beta_delta_prior_variance"]]), 2L)
+    if (moments[["beta_delta_prior_sd"]] <= 0 ||
+        inherits(try(chol(joint), silent = TRUE), "try-error")) fail("the full beta/delta posterior covariance is not positive definite")
+  }
+  c(as.list(moments), list(
+    source_draw_count = source_count, moment_source = moment_source,
+    source_count_status = if (is.finite(source_count)) "recorded_full_posterior_count" else "not_recorded_in_legacy_filtered_object",
+    signature = paste(c("stage2_posterior_normal_approximation", gene,
+                        format(source_count, digits = 17), format(moments, digits = 17)), collapse = "|")))
+}
+
 #' Convert retained Stage 2 MCMC models into the compact Stage 3 EM interface.
 #'
-#' Stage 2 target-TF posterior means are supplied only as EM initial values. For
+#' Full Stage 2 target-coefficient posterior moments define a joint Normal prior
+#' for Stage 3, without variance inflation. For
 #' each retained joint posterior draw, eta0 contains the intercept, condition,
 #' batch, offset, and every confounder contribution, but deliberately excludes
 #' the target-TF main effect and target-TF-by-condition interaction. The EM
-#' M-step uses the original knowledge Laplace prior also supplied to Stage 2,
+#' M-step uses this posterior Normal approximation,
 #' while the target-TF expression is replaced by latent activity A.
 build_TF_EM_stage2_input <- function(
   stage1_filtered_results,
@@ -140,8 +256,12 @@ build_TF_EM_stage2_input <- function(
   )
   beta_target_mean_init <- beta_target_delta_init <-
     beta_target_control_init <- beta_target_disease_init <-
-      beta_lambda_positive <- beta_lambda_negative <- target_interaction_sd <-
+      beta_prior_mean <- beta_prior_variance <- beta_prior_sd <- target_interaction_sd <-
+        beta_delta_prior_mean <- beta_delta_prior_variance <- beta_delta_prior_sd <- beta_delta_prior_covariance <-
         stats::setNames(rep(NA_real_, G), target_genes)
+  stage2_posterior_draw_count <- stats::setNames(rep(NA_real_, G), target_genes)
+  stage2_posterior_prior_signature <- stats::setNames(rep(NA_character_, G), target_genes)
+  stage2_posterior_prior_metadata <- stats::setNames(vector("list", G), target_genes)
   source_draw_index <- setNames(vector("list", G), target_genes)
   confounders <- setNames(vector("list", G), target_genes)
   knowledge_priors <- setNames(vector("list", G), target_genes)
@@ -155,9 +275,9 @@ build_TF_EM_stage2_input <- function(
       tf_em_stage2_input_stop("Stage 1 input `%s` is not ready.", gene)
     }
     if (!identical(draws$interface_version,
-                   "tf_em_stage2_parameter_draws_v2") ||
-        !identical(draws$prior_family, "laplace") ||
-        !identical(draws$beta_prior_family, "laplace") ||
+                   "tf_em_stage2_parameter_draws_v3") ||
+        !identical(draws$prior_family, "normal") ||
+        !identical(draws$beta_prior_family, "normal") ||
         !identical(as.integer(draws$draw_count), source_draw_count)) {
       tf_em_stage2_input_stop(
         "Gene `%s` has an incompatible Stage 2 draw interface or draw count.",
@@ -185,16 +305,16 @@ build_TF_EM_stage2_input <- function(
     feature_names <- as.character(input$feature_names)
     target_index <- as.integer(input$target_tf_index)
     expected_prior <- tf_stage2_knowledge_prior(input$stan_data)
-    if (!identical(names(draws$beta_lambda_positive), feature_names) ||
-        !identical(names(draws$beta_lambda_negative), feature_names) ||
-        !isTRUE(all.equal(as.numeric(draws$beta_lambda_positive),
-                          as.numeric(expected_prior$beta_lambda_positive),
-                          tolerance = 1e-12, check.attributes = FALSE)) ||
-        !isTRUE(all.equal(as.numeric(draws$beta_lambda_negative),
-                          as.numeric(expected_prior$beta_lambda_negative),
-                          tolerance = 1e-12, check.attributes = FALSE))) {
+    prior_fields <- c("beta_prior_mean", "beta_prior_variance", "beta_prior_sd")
+    matching_prior <- vapply(prior_fields, function(field) {
+      identical(names(draws[[field]]), feature_names) &&
+        isTRUE(all.equal(as.numeric(draws[[field]]),
+                         as.numeric(expected_prior[[field]]),
+                         tolerance = 1e-12, check.attributes = FALSE))
+    }, logical(1))
+    if (!all(matching_prior)) {
       tf_em_stage2_input_stop(
-        "Knowledge Laplace prior metadata differ from the Stage 2 input for `%s`.", gene
+        "Knowledge Normal prior metadata differ from the Stage 2 input for `%s`.", gene
       )
     }
     if (!identical(colnames(draws$beta), feature_names) ||
@@ -298,6 +418,7 @@ build_TF_EM_stage2_input <- function(
 
     target_row <- model$target_tf
     target_name <- feature_names[[target_index]]
+    posterior_prior <- tf_stage2_posterior_normal_prior(model, gene, has_condition)
     Y[, g] <- as.integer(input$stan_data$Y)
     eta0_draws[, , g] <- eta0
     phi_draws[, g] <- phi_nuisance
@@ -317,8 +438,16 @@ build_TF_EM_stage2_input <- function(
     } else {
       target_row$beta_mean[[1]]
     }
-    beta_lambda_positive[[g]] <- draws$beta_lambda_positive[[target_name]]
-    beta_lambda_negative[[g]] <- draws$beta_lambda_negative[[target_name]]
+    beta_prior_mean[[g]] <- posterior_prior$beta_prior_mean
+    beta_prior_variance[[g]] <- posterior_prior$beta_prior_variance
+    beta_prior_sd[[g]] <- posterior_prior$beta_prior_sd
+    beta_delta_prior_mean[[g]] <- posterior_prior$beta_delta_prior_mean
+    beta_delta_prior_variance[[g]] <- posterior_prior$beta_delta_prior_variance
+    beta_delta_prior_sd[[g]] <- posterior_prior$beta_delta_prior_sd
+    beta_delta_prior_covariance[[g]] <- posterior_prior$beta_delta_prior_covariance
+    stage2_posterior_draw_count[[g]] <- posterior_prior$source_draw_count
+    stage2_posterior_prior_signature[[g]] <- posterior_prior$signature
+    stage2_posterior_prior_metadata[[g]] <- posterior_prior
     knowledge_priors[[g]] <- expected_prior
     target_interaction_sd[[g]] <- draws$target_interaction_sd
     source_draw_index[[g]] <- if (identical(nuisance_storage, "posterior_mean")) {
@@ -342,7 +471,7 @@ build_TF_EM_stage2_input <- function(
   }
 
   result <- list(
-    interface_version = "tf_em_stage2_input_v4",
+    interface_version = "tf_em_stage2_input_v6",
     pipeline_stage = "em_input",
     model_version = expected_model_version,
     target_tf = first_input$target_tf,
@@ -369,10 +498,19 @@ build_TF_EM_stage2_input <- function(
     beta_target_delta_init = beta_target_delta_init,
     beta_target_control_init = beta_target_control_init,
     beta_target_disease_init = beta_target_disease_init,
-    beta_prior_family = "laplace",
-    beta_lambda_positive = beta_lambda_positive,
-    beta_lambda_negative = beta_lambda_negative,
-    knowledge_priors = knowledge_priors,
+    beta_prior_family = "normal",
+    beta_prior_source = "stage2_posterior_normal_approximation",
+    beta_prior_mean = beta_prior_mean,
+    beta_prior_variance = beta_prior_variance,
+    beta_prior_sd = beta_prior_sd,
+    beta_delta_prior_mean = beta_delta_prior_mean,
+    beta_delta_prior_variance = beta_delta_prior_variance,
+    beta_delta_prior_sd = beta_delta_prior_sd,
+    beta_delta_prior_covariance = beta_delta_prior_covariance,
+    stage2_posterior_draw_count = stage2_posterior_draw_count,
+    stage2_posterior_prior_signature = stage2_posterior_prior_signature,
+    stage2_posterior_prior_metadata = stage2_posterior_prior_metadata,
+    stage2_knowledge_priors = knowledge_priors,
     target_interaction_sd = target_interaction_sd,
     source_draw_index = source_draw_index,
     confounders = confounders,

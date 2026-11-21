@@ -33,7 +33,7 @@ tf_three_stage_read_input <- function(screening_input) {
 
 # Three-stage TF activity pipeline:
 #   Stage 1: Laplace-prior ADVI or MCMC; filter genes and confounders.
-#   Stage 2: knowledge Laplace-prior MCMC; filter genes only, retain confounders.
+#   Stage 2: confidence/direction Normal-prior MCMC; retain confounders.
 #   Stage 3: joint activity/coefficient sampling or explicit quadrature EM.
 run_TF_three_stage_pipeline <- function(
   screening_input,
@@ -139,13 +139,13 @@ run_TF_three_stage_pipeline <- function(
     prescreen_fit = paste0(prescreen_prefix, "_fit.rds"),
     prescreen_checkpoint = paste0(prescreen_prefix, "_checkpoint.rds"),
     prescreen_filtered = paste0(prefix, "_stage1_prescreen_filtered.rds"),
-    mcmc_input = paste0(prefix, "_stage2_laplace_mcmc_input.rds"),
-    mcmc_fit = paste0(prefix, "_stage2_laplace_mcmc_fit.rds"),
-    mcmc_checkpoint = paste0(prefix, "_stage2_laplace_mcmc_checkpoint.rds"),
-    mcmc_filtered = paste0(prefix, "_stage2_laplace_mcmc_gene_filtered.rds"),
-    em_input = paste0(prefix, "_stage3_laplace_em_input.rds"),
-    em_fit = paste0(prefix, "_stage3_laplace_em_fit.rds"),
-    em_checkpoint = paste0(prefix, "_stage3_laplace_em_checkpoint.rds"),
+    mcmc_input = paste0(prefix, "_stage2_normal_mcmc_input.rds"),
+    mcmc_fit = paste0(prefix, "_stage2_normal_mcmc_fit.rds"),
+    mcmc_checkpoint = paste0(prefix, "_stage2_normal_mcmc_checkpoint.rds"),
+    mcmc_filtered = paste0(prefix, "_stage2_normal_mcmc_gene_filtered.rds"),
+    em_input = paste0(prefix, "_stage3_posterior_normal_em_input.rds"),
+    em_fit = paste0(prefix, "_stage3_posterior_normal_em_fit.rds"),
+    em_checkpoint = paste0(prefix, "_stage3_posterior_normal_em_checkpoint.rds"),
     em_source_draws = paste0(prefix, "_stage3_selected_stage2_draws.csv"),
     prescreen_gene_summary = paste0(
       prefix, "_stage1_prescreen_gene_summary.csv"
@@ -227,7 +227,7 @@ run_TF_three_stage_pipeline <- function(
     screening_input = mcmc_input,
     cores = cores,
     inference = "mcmc",
-    prior_family = "laplace",
+    prior_family = "normal",
     target_interval = mcmc_target_interval,
     confounder_interval = mcmc_confounder_interval,
     chains = mcmc_chains,
@@ -353,7 +353,7 @@ run_TF_three_stage_pipeline <- function(
   ))
   timing <- data.frame(
     stage = c(if (prescreen_mcmc) "stage1_prescreen_mcmc" else "stage1_prescreen_vi",
-              "stage2_laplace_mcmc", "stage3_em"),
+              "stage2_normal_mcmc", "stage3_em"),
     elapsed_seconds = c(
       prescreen_elapsed_seconds,
       mcmc_elapsed_seconds,

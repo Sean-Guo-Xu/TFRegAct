@@ -25,7 +25,7 @@ filter_TF_mcmc_gene_results <- function(
     target_tf <- attr(screening_results, "target_tf")
     if (is.null(target_tf) || !nzchar(target_tf[[1]])) target_tf <- "target_TF"
     output_file <- file.path(output_dir,
-      sprintf("%s_stage2_laplace_mcmc_gene_filtered.rds", target_tf[[1]]))
+      sprintf("%s_stage2_normal_mcmc_gene_filtered.rds", target_tf[[1]]))
   }
   output_file <- normalizePath(output_file, winslash = "/", mustWork = FALSE)
   dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
@@ -42,10 +42,10 @@ tf_mcmc_gene_filter_once <- function(
          call. = FALSE)
   }
   if (!identical(attr(screening_results, "inference"), "mcmc") ||
-      !identical(attr(screening_results, "prior_family"), "laplace") ||
+      !identical(attr(screening_results, "prior_family"), "normal") ||
       !identical(attr(screening_results, "input_pipeline_stage"), "mcmc_input")) {
     stop(
-      "Stage 2 filtering requires MCMC results from the knowledge Laplace-prior model.",
+      "Stage 2 filtering requires MCMC results from the knowledge Normal-prior model.",
       call. = FALSE
     )
   }
@@ -116,8 +116,10 @@ tf_mcmc_gene_filter_once <- function(
     if (!is.list(model$stage2_parameter_draws) ||
         !identical(
           model$stage2_parameter_draws$interface_version,
-          "tf_em_stage2_parameter_draws_v2"
-        )) {
+          "tf_em_stage2_parameter_draws_v3"
+        ) ||
+        !identical(model$stage2_parameter_draws$prior_family, "normal") ||
+        !identical(model$stage2_parameter_draws$beta_prior_family, "normal")) {
       stop(sprintf(
         "Stage 1 model `%s` does not contain the EM Stage 2 draw interface.",
         gene
@@ -192,6 +194,8 @@ tf_mcmc_gene_filter_once <- function(
         target_tf = model$target_tf,
         confounders = model$confounders,
         stage2_parameter_draws = model$stage2_parameter_draws,
+        target_screening_draws = model$target_screening_draws,
+        diagnostics = model$diagnostics,
         control_level = model$control_level,
         disease_level = model$disease_level,
         condition_model = has_condition
@@ -247,7 +251,7 @@ tf_mcmc_gene_filter_once <- function(
   attr(filtered, "pipeline_stage") <- "mcmc"
   attr(filtered, "target_tf") <- attr(screening_results, "target_tf")
   attr(filtered, "model_version") <- attr(screening_results, "model_version")
-  attr(filtered, "prior_family") <- "laplace"
+  attr(filtered, "prior_family") <- "normal"
   attr(filtered, "target_interval") <- target_interval
   attr(filtered, "confounder_interval") <- confounder_interval
   attr(filtered, "confounders_filtered") <- FALSE
@@ -279,7 +283,7 @@ tf_mcmc_gene_filter_once <- function(
 }
 
 # Backward-compatible name. Its behavior now follows the three-stage design:
-# it accepts only knowledge Laplace-prior MCMC results and never filters confounders.
+# it accepts only knowledge Normal-prior MCMC results and never filters confounders.
 filter_TF_stage1_screening_results <- function(
   screening_results,
   target_interval = 0.90,

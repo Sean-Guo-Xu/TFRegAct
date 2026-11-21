@@ -61,25 +61,30 @@ The condition main effect and optional batch contrasts remain in W. Random
 intercepts and slopes use noncentered parameterization, with a shared slope SD
 across conditions. Only the focal TF receives a random slope.
 
-The coefficient prior is the same confidence-weighted directional Laplace prior
-used in Stage 1, restricted to the retained predictors:
+Stage 1 retains its confidence-weighted directional Laplace prior. Stage 2
+assigns each retained predictor a network-informed Normal prior:
 
 ```text
-scale[j] = gamma * (max(confidence[j], 1) / 10)^eta
-log p(beta[j]) = constant - abs(beta[j]) / scale[j] *
-                (1 + (r_dir - 1) * I(direction[j] * beta[j] < 0))
+q[j] = (min(10, max(confidence[j], 1)) - 1) / 9
+prior_mean[j] = direction[j] * (0.2 + 0.4 * q[j])
+prior_variance[j] = 0.5 + 1.5 * q[j]
+beta[j] ~ Normal(prior_mean[j], sqrt(prior_variance[j]))
 ```
 
-Defaults are `gamma = 1`, `eta = 0.5` and `r_dir = 3`; the default delta SD is
-0.5 and both random-effect SD scales are 1. Stage 1 posterior summaries are used
-for screening and initialization, not as Stage 2 prior parameters. The original
-network confidence and direction determine the prior once in each refit.
+The Normal scale argument above is the standard deviation. Direction is +1 for
+activation, -1 for repression, and 0 for unknown or mixed direction. The
+variance ranges from 0.5 at confidence 1 to 2 at confidence 10; known-direction
+mean magnitudes range from 0.2 to 0.6. This fixed mapping does not change when
+the confidence filtering threshold changes. The default delta SD is 0.5 and
+both random-effect SD scales are 1. Stage 1 posterior summaries are used for
+screening and initialization, not as Stage 2 prior parameters. Network
+confidence and direction determine the Normal prior directly.
 The production model is `TF_stage2_hierarchical_nb_model.stan`.
 `TF_stage1_hierarchical_nb_model.stan` remains an experimental reference.
 
 Stage 1 uses expression that has not been centered within biological sample,
 whereas the hierarchy estimates within-sample slopes. These are different
-estimands on the same predictor units; Stage 2 uses the original network prior
+estimands on the same predictor units; Stage 2 constructs its network-informed Normal prior
 on that scale, rather than transferring a Stage 1 posterior for a different
 estimand. The same expression observations are refitted after screening; this
 is not a sequential update with an independent second dataset. Centering does
@@ -89,8 +94,9 @@ contrast.
 
 The old `direction_effect`, `beta_sd_floor` and `stage1_sd_multiplier`
 arguments default to `NULL` and are deprecated: non-`NULL` values are ignored
-with a warning. Saved Stage 2 fits from the earlier posterior-informed Normal
-prior version must be refitted before interpretation under the current model.
+with a warning. Saved Stage 2 fits from either the directional-Laplace or
+earlier posterior-informed Normal version must be refitted before interpretation
+under the current network-informed Normal model.
 
 ## Validation and outputs
 
@@ -129,5 +135,10 @@ result$stage2_fit$sample_map
 result$stage2_fit$fit$summary(c("beta_target_control", "beta_target_disease", "beta_target_delta"))
 ```
 
-The activity/EM workflow is separate and retains its existing models. This
-change routes the complete TF–gene regulatory workflow only.
+The activity workflow uses this network-informed Normal prior in its
+non-hierarchical Stage 2 model. Its Stage 3 sampler or quadrature EM fit uses
+a Gaussian approximation to the full Stage 2 posterior of the focal-TF
+coefficient and optional interaction. That approximation retains both
+posterior means and their covariance, without SD inflation or an added variance
+floor. The activity workflow's routing remains separate from this
+biological-sample hierarchy.

@@ -1,2 +1,3 @@
 inst/stan/*.exe
 inst/stan/*.hpp
+/adjustment_output/

@@ -1094,7 +1094,7 @@ tf_stage2_prior_data_from_stage1 <- function(analysis_object, stage1_fit_result)
       anyNA(features) || anyDuplicated(toupper(features))) {
     tf_model_stop("Stage 2 requires the original Stage 1 prior data and feature names; refit legacy Stage 1 results.")
   }
-  tf_stage2_knowledge_prior(source)
+  tf_stage1_knowledge_prior(source)
   index <- match(toupper(rownames(analysis_object$expr)), toupper(features))
   if (anyNA(index)) tf_model_stop("Stage 1 knowledge-prior metadata do not cover all retained TFs.")
   list(confidence = as.numeric(source$confidence[index]),
@@ -1177,6 +1177,9 @@ tf_prepare_stage2_stan_data <- function(
   stan_data <- base_data[stan_data_names]
 
   stage2_prior <- tf_stage2_knowledge_prior(stan_data)
+  stan_data$beta_prior_mean <- stage2_prior$beta_prior_mean
+  stan_data$beta_prior_variance <- stage2_prior$beta_prior_variance
+  stan_data$beta_prior_sd <- stage2_prior$beta_prior_sd
   stan_data$beta_init <- beta_summary$stage1_beta_mean
 
   target_tf <- as.character(attr(base_data, "target")[[1]])
